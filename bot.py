@@ -1,8 +1,9 @@
-from aiohttp import web
 from aiogram.webhook.aiohttp_server import (
     SimpleRequestHandler,
     setup_application,
-)import os
+)
+
+import os
 import asyncio
 import sqlite3
 import logging
