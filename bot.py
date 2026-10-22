@@ -8,6 +8,15 @@ import asyncio
 import sqlite3
 import logging
 from aiohttp import web
+from aiogram.webhook.aiohttp_server import (
+    SimpleRequestHandler,
+    setup_application,
+)
+
+WEBHOOK_PATH = "/webhook"
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
+WEBHOOK_URL = os.getenv("RENDER_EXTERNAL_URL", "") + WEBHOOK_PATH
+from aiohttp import web
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart, Command
