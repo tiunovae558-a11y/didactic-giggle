@@ -447,9 +447,44 @@ async def users(message: Message):
 # =========================
 # ЗАПУСК
 # =========================
+from aiogram.webhook.aiohttp_server import (
+    SimpleRequestHandler,
+    setup_application,
+)
+
+WEBHOOK_PATH = "/webhook"
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
+WEBHOOK_URL = os.getenv("RENDER_EXTERNAL_URL", "") + WEBHOOK_PATH
+
+
+async def on_startup(bot: Bot):
+    if not WEBHOOK_SECRET or not os.getenv("RENDER_EXTERNAL_URL"):
+        raise RuntimeError("Webhook settings are missing")
+
+    await bot.set_webhook(
+        WEBHOOK_URL,
+        secret_token=WEBHOOK_SECRET,
+    )
+
 
 async def main():
-    await dp.start_polling(bot)
+    app = web.Application()
+
+    dp.startup.register(on_startup)
+
+    SimpleRequestHandler(
+        dispatcher=dp,
+        bot=bot,
+        secret_token=WEBHOOK_SECRET,
+    ).register(app, path=WEBHOOK_PATH)
+
+    setup_application(app, dp, bot=bot)
+
+    web.run_app(
+        app,
+        host="0.0.0.0",
+        port=int(os.getenv("PORT", "10000")),
+    )
 
 
 if __name__ == "__main__":
