@@ -488,4 +488,8 @@ async def main():
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    web.run_app(
+        create_app(),
+        host="0.0.0.0",
+        port=int(os.getenv("PORT", "10000")),
+    )
