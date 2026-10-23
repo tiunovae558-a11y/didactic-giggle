@@ -1,15 +1,27 @@
-services:
-  - type: worker
-    name: protivzla-ultimate
-    runtime: python
-    buildCommand: pip install -r requirements.txt
-    startCommand: python bot.py
-    envVars:
-      - key: BOT_TOKEN
-        sync: false
-      - key: ADMIN_IDS
-        sync: false
-      - key: REQUIRED_CHAT
-        sync: false
-      - key: REQUIRED_CHAT_URL
-        sync: false
+# PROTIVZLA ULTIMATE
+
+Telegram-бот на Python и aiogram 3.
+
+## Возможности
+
+- Русскоязычное меню
+- Магазин и заявки на товары
+- Избранное
+- Генератор случайных имён
+- Ежедневные награды
+- Промокоды
+- VIP-статусы
+- Поддержка пользователей
+- Панель владельца
+- Статистика и журнал действий
+- Рассылки с текстом или фотографией
+- URL-кнопки
+- Предпросмотр рассылки
+- Планирование рассылок
+- Резервное копирование SQLite
+
+## Установка
+
+```bash
+pip install -r requirements.txt
+python bot.py
