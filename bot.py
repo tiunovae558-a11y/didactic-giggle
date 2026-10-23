@@ -1,498 +1,717 @@
-from aiogram.webhook.aiohttp_server import (
-    SimpleRequestHandler,
-    setup_application,
-)
-
 import os
-import asyncio
+import random
 import sqlite3
 import logging
-from aiohttp import web
-from aiogram.webhook.aiohttp_server import (
-    SimpleRequestHandler,
-    setup_application,
-)
+import secrets
+import string
+from datetime import datetime, timezone
 
-WEBHOOK_PATH = "/webhook"
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
-WEBHOOK_URL = os.getenv("RENDER_EXTERNAL_URL", "") + WEBHOOK_PATH
-from aiohttp import web
-
-from aiogram import Bot, Dispatcher, F
-from aiogram.filters import CommandStart, Command
-from aiogram.types import (
-    Message,
-    CallbackQuery,
-    InlineKeyboardMarkup,
+from telegram import (
+    Update,
     InlineKeyboardButton,
-    LabeledPrice,
-    PreCheckoutQuery,
+    InlineKeyboardMarkup,
+)
+from telegram.constants import ChatMemberStatus
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    CallbackQueryHandler,
+    MessageHandler,
+    ContextTypes,
+    filters,
 )
 
 # =========================
-# НАСТРОЙКИ METROSHOP
+# CONFIGURATION
 # =========================
 
-TOKEN = os.getenv("BOT_TOKEN", "")
-ADMIN_IDS = [
-    int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()
-]
-
-CHANNEL_ID = os.getenv("CHANNEL_ID", "")
-CHANNEL_URL = os.getenv("CHANNEL_URL", "")
-
-if not TOKEN:
-    raise RuntimeError("Добавь BOT_TOKEN в переменные окружения!")
-
-bot = Bot(TOKEN)
-dp = Dispatcher()
-
-logging.basicConfig(level=logging.INFO)
-
-# =========================
-# БАЗА ДАННЫХ
-# =========================
-
-db = sqlite3.connect("metroshop.db")
-db.execute("""
-CREATE TABLE IF NOT EXISTS users (
-    user_id INTEGER PRIMARY KEY
-)
-""")
-
-db.execute("""
-CREATE TABLE IF NOT EXISTS orders (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id INTEGER,
-    product TEXT,
-    price INTEGER,
-    status TEXT DEFAULT 'paid'
-)
-""")
-db.commit()
-
-# =========================
-# ТОВАРЫ
-# =========================
-
-PRODUCTS = {
-    "sites": {
-        "name": "🌐 Сайты",
-        "items": [
-            ("site1", "💻 Современный сайт", 100),
-            ("site2", "🖥️ Бизнес-сайт", 100),
-            ("site3", "🌌 Тёмный сайт", 100),
-        ],
-    },
-    "accounts": {
-        "name": "📱 Telegram-аккаунты",
-        "items": [
-            ("acc1", "🇺🇸 США", 50),
-            ("acc2", "🇬🇧 Великобритания", 50),
-            ("acc3", "🇩🇪 Германия", 50),
-            ("acc4", "🇫🇷 Франция", 50),
-            ("acc5", "🇮🇹 Италия", 50),
-            ("acc6", "🇪🇸 Испания", 50),
-            ("acc7", "🇹🇷 Турция", 50),
-            ("acc8", "🇧🇷 Бразилия", 50),
-            ("acc9", "🇮🇳 Индия", 50),
-            ("acc10", "🇯🇵 Япония", 50),
-            ("acc11", "🇰🇷 Южная Корея", 50),
-            ("acc12", "🇨🇦 Канада", 50),
-            ("acc13", "🇦🇺 Австралия", 50),
-            ("acc14", "🇸🇪 Швеция", 50),
-        ],
-    },
-    "gifts": {
-        "name": "🎁 Подарки",
-        "items": [
-            ("gift1", "🧸 Мишка", 15),
-            ("gift2", "❤️ Сердце", 15),
-            ("gift3", "🌹 Роза", 25),
-            ("gift4", "🎁 Подарок", 25),
-            ("gift5", "🎂 Торт", 50),
-            ("gift6", "🥂 Шампанское", 50),
-            ("gift7", "💐 Цветы", 50),
-            ("gift8", "🏆 Кубок", 100),
-            ("gift9", "💍 Кольцо", 100),
-            ("gift10", "💎 Алмазик", 100),
-        ],
-    },
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+ADMIN_IDS = {
+    int(x.strip())
+    for x in os.environ.get("ADMIN_IDS", "").split(",")
+    if x.strip().isdigit()
 }
 
+REQUIRED_CHAT = "@ProtivzlaNFT"
+REQUIRED_CHAT_URL = "https://t.me/ProtivzlaNFT"
+DB_PATH = os.environ.get("DB_PATH", "bot.db")
+
+logging.basicConfig(
+    format="%(asctime)s | %(levelname)s | %(message)s",
+    level=logging.INFO,
+)
+logger = logging.getLogger(__name__)
+
+
 # =========================
-# КЛАВИАТУРЫ
+# DATABASE
 # =========================
 
-def main_keyboard():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(
-            text="🌐 Сайты",
-            callback_data="category:sites"
-        )],
-        [InlineKeyboardButton(
-            text="📱 Аккаунты",
-            callback_data="category:accounts"
-        )],
-        [InlineKeyboardButton(
-            text="🎁 Подарки",
-            callback_data="category:gifts"
-        )],
-        [InlineKeyboardButton(
-            text="👤 Поддержка",
-            url="https://t.me/"
-        )],
-    ])
+def db():
+    return sqlite3.connect(DB_PATH)
 
 
-def products_keyboard(category):
-    rows = []
-
-    for product_id, name, price in PRODUCTS[category]["items"]:
-        rows.append([
-            InlineKeyboardButton(
-                text=f"{name} — {price} ⭐",
-                callback_data=f"buy:{category}:{product_id}"
+def init_db():
+    with db() as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                username TEXT,
+                first_name TEXT,
+                joined_at TEXT,
+                last_seen TEXT,
+                blocked INTEGER DEFAULT 0
             )
-        ])
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                action TEXT,
+                details TEXT,
+                created_at TEXT
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS favorites (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                value TEXT,
+                created_at TEXT
+            )
+        """)
 
-    rows.append([
-        InlineKeyboardButton(
-            text="⬅️ Назад",
-            callback_data="home"
-        )
-    ])
 
-    return InlineKeyboardMarkup(inline_keyboard=rows)
+def save_user(user):
+    now = datetime.now(timezone.utc).isoformat()
+    with db() as conn:
+        conn.execute("""
+            INSERT INTO users
+                (user_id, username, first_name, joined_at, last_seen)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+                username = excluded.username,
+                first_name = excluded.first_name,
+                last_seen = excluded.last_seen
+        """, (
+            user.id,
+            user.username or "",
+            user.first_name or "",
+            now,
+            now,
+        ))
+
+
+def log_action(user_id, action, details=""):
+    with db() as conn:
+        conn.execute("""
+            INSERT INTO history (user_id, action, details, created_at)
+            VALUES (?, ?, ?, ?)
+        """, (
+            user_id,
+            action,
+            details[:500],
+            datetime.now(timezone.utc).isoformat(),
+        ))
+
+
+def is_blocked(user_id):
+    with db() as conn:
+        row = conn.execute(
+            "SELECT blocked FROM users WHERE user_id = ?",
+            (user_id,),
+        ).fetchone()
+    return bool(row and row[0])
+
+
+def set_blocked(user_id, value):
+    with db() as conn:
+        conn.execute("""
+            UPDATE users SET blocked = ? WHERE user_id = ?
+        """, (int(value), user_id))
 
 
 # =========================
-# ПРОВЕРКА ПОДПИСКИ
+# SUBSCRIPTION CHECK
 # =========================
 
-async def subscribed(user_id):
-    if not CHANNEL_ID:
-        return True
-
+async def check_subscription(context, user_id):
     try:
-        member = await bot.get_chat_member(
-            chat_id=CHANNEL_ID,
-            user_id=user_id
+        member = await context.bot.get_chat_member(
+            REQUIRED_CHAT,
+            user_id,
         )
-
-        return member.status in ("member", "administrator", "creator")
-
+        return member.status in (
+            ChatMemberStatus.MEMBER,
+            ChatMemberStatus.ADMINISTRATOR,
+            ChatMemberStatus.OWNER,
+        )
     except Exception:
+        logger.exception("Subscription check failed")
         return False
 
 
-async def require_subscription(message: Message):
-    if await subscribed(message.from_user.id):
-        return True
-
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+def subscription_keyboard():
+    return InlineKeyboardMarkup([
         [InlineKeyboardButton(
-            text="📢 Подписаться на канал",
-            url=CHANNEL_URL
+            "📢 Вступить в группу",
+            url=REQUIRED_CHAT_URL,
         )],
         [InlineKeyboardButton(
-            text="✅ Проверить подписку",
-            callback_data="check_sub"
+            "✅ Проверить подписку",
+            callback_data="check_subscription",
         )],
     ])
 
-    await message.answer(
-        "🔒 Чтобы пользоваться METROSHOP, "
-        "сначала подпишись на наш канал!",
-        reply_markup=keyboard
+
+async def require_subscription(update, context):
+    user = update.effective_user
+    if not user:
+        return False
+
+    if await check_subscription(context, user.id):
+        return True
+
+    text = (
+        "🔒 PROTIVZLA ULTIMATE\n\n"
+        "Для использования бота необходимо вступить "
+        "в нашу группу.\n\n"
+        "После вступления нажми «Проверить подписку»."
     )
+
+    if update.callback_query:
+        await update.callback_query.answer()
+        await update.callback_query.message.reply_text(
+            text,
+            reply_markup=subscription_keyboard(),
+        )
+    elif update.effective_message:
+        await update.effective_message.reply_text(
+            text,
+            reply_markup=subscription_keyboard(),
+        )
+
     return False
 
 
 # =========================
-# СТАРТ
+# MENUS
 # =========================
 
-@dp.message(CommandStart())
-async def start(message: Message):
-    db.execute(
-        "INSERT OR IGNORE INTO users(user_id) VALUES (?)",
-        (message.from_user.id,)
+def main_keyboard(user_id):
+    rows = [
+        [
+            InlineKeyboardButton("🔎 DATA HUNTER", callback_data="data"),
+            InlineKeyboardButton("🛡 SECURITY", callback_data="security"),
+        ],
+        [
+            InlineKeyboardButton("🌐 WEB TOOLS", callback_data="webtools"),
+            InlineKeyboardButton("🎭 Генератор ников", callback_data="nick"),
+        ],
+        [
+            InlineKeyboardButton("📋 История", callback_data="history"),
+            InlineKeyboardButton("⭐ Избранное", callback_data="favorites"),
+        ],
+        [
+            InlineKeyboardButton("👤 Профиль", callback_data="profile"),
+            InlineKeyboardButton("📊 Статистика", callback_data="stats"),
+        ],
+    ]
+
+    if user_id in ADMIN_IDS:
+        rows.append([
+            InlineKeyboardButton("👑 Админ-панель", callback_data="admin")
+        ])
+
+    return InlineKeyboardMarkup(rows)
+
+
+async def show_main(update, context):
+    user = update.effective_user
+    text = (
+        "👑 PROTIVZLA ULTIMATE\n\n"
+        "💚 Добро пожаловать!\n"
+        "Выбери нужный раздел в меню ниже."
     )
-    db.commit()
 
-    if not await require_subscription(message):
-        return
-
-    await message.answer(
-        "💙 <b>METROSHOP</b>\n\n"
-        "Добро пожаловать в наш магазин!\n\n"
-        "🌐 Сайты — 100 ⭐\n"
-        "📱 Аккаунты — 50 ⭐\n"
-        "🎁 Подарки — от 15 ⭐\n\n"
-        "Выбирай категорию ниже 👇",
-        reply_markup=main_keyboard(),
-        parse_mode="HTML"
-    )
-
-
-@dp.callback_query(F.data == "check_sub")
-async def check_sub(callback: CallbackQuery):
-    if await subscribed(callback.from_user.id):
-        await callback.message.answer(
-            "💙 Подписка подтверждена!",
-            reply_markup=main_keyboard()
+    if update.callback_query:
+        await update.callback_query.edit_message_text(
+            text,
+            reply_markup=main_keyboard(user.id),
         )
     else:
-        await callback.answer(
-            "Сначала подпишись на канал!",
-            show_alert=True
+        await update.effective_message.reply_text(
+            text,
+            reply_markup=main_keyboard(user.id),
         )
 
-    await callback.answer()
 
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    save_user(user)
 
-@dp.callback_query(F.data == "home")
-async def home(callback: CallbackQuery):
-    if not await subscribed(callback.from_user.id):
-        await callback.answer(
-            "Сначала подпишись на канал!",
-            show_alert=True
+    if is_blocked(user.id):
+        await update.effective_message.reply_text(
+            "⛔ Доступ к боту ограничен."
         )
         return
 
-    await callback.message.edit_text(
-        "💙 METROSHOP\n\nВыбери категорию:",
-        reply_markup=main_keyboard()
-    )
-    await callback.answer()
+    if not await require_subscription(update, context):
+        return
+
+    log_action(user.id, "start")
+    await show_main(update, context)
 
 
 # =========================
-# КАТАЛОГ
+# NICKNAME GENERATOR
 # =========================
 
-@dp.callback_query(F.data.startswith("category:"))
-async def category(callback: CallbackQuery):
-    if not await subscribed(callback.from_user.id):
-        await callback.answer(
-            "Сначала подпишись на канал!",
-            show_alert=True
+PREFIXES = [
+    "Dark", "Green", "Shadow", "Ghost", "Storm",
+    "Neo", "Frost", "Night", "Cyber", "Royal",
+    "Ultra", "Toxic", "Silent", "Emerald", "Alpha",
+]
+
+SUFFIXES = [
+    "Wolf", "Hunter", "King", "Fox", "Dragon",
+    "Ninja", "Legend", "Phantom", "Rider", "Blade",
+    "Star", "Pixel", "Tiger", "Knight", "Master",
+]
+
+
+def generate_nick():
+    style = random.randint(1, 4)
+
+    if style == 1:
+        return random.choice(PREFIXES) + random.choice(SUFFIXES)
+
+    if style == 2:
+        return (
+            random.choice(PREFIXES)
+            + "_"
+            + random.choice(SUFFIXES)
         )
-        return
 
-    category_id = callback.data.split(":")[1]
+    if style == 3:
+        return (
+            random.choice(PREFIXES)
+            + str(random.randint(10, 9999))
+        )
 
-    await callback.message.edit_text(
-        f"💙 <b>{PRODUCTS[category_id]['name']}</b>\n\n"
-        "Выбери товар:",
-        reply_markup=products_keyboard(category_id),
-        parse_mode="HTML"
+    return (
+        random.choice(PREFIXES)
+        + random.choice(SUFFIXES)
+        + str(random.randint(1, 99))
     )
-    await callback.answer()
 
 
 # =========================
-# ПОКУПКА И ОПЛАТА
+# CALLBACKS
 # =========================
 
-@dp.callback_query(F.data.startswith("buy:"))
-async def buy(callback: CallbackQuery):
-    if not await subscribed(callback.from_user.id):
-        await callback.answer(
-            "Сначала подпишись на канал!",
-            show_alert=True
-        )
-        return
+async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user = update.effective_user
+    data = query.data
 
-    _, category_id, product_id = callback.data.split(":")
+    if data == "check_subscription":
+        await query.answer()
 
-    product = next(
-        (
-            item for item in PRODUCTS[category_id]["items"]
-            if item[0] == product_id
-        ),
-        None
-    )
-
-    if not product:
-        await callback.answer("Товар не найден", show_alert=True)
-        return
-
-    _, name, price = product
-
-    await bot.send_invoice(
-        chat_id=callback.from_user.id,
-        title=name,
-        description=f"Покупка в METROSHOP: {name}",
-        payload=f"{category_id}:{product_id}",
-        currency="XTR",
-        prices=[LabeledPrice(label=name, amount=price)]
-    )
-
-    await callback.answer()
-
-
-@dp.pre_checkout_query()
-async def pre_checkout(pre_checkout: PreCheckoutQuery):
-    if not await subscribed(pre_checkout.from_user.id):
-        await pre_checkout.answer(
-            ok=False,
-            error_message="Сначала подпишись на канал."
-        )
-        return
-
-    await pre_checkout.answer(ok=True)
-
-
-@dp.message(F.successful_payment)
-async def successful_payment(message: Message):
-    payment = message.successful_payment
-    user_id = message.from_user.id
-
-    db.execute(
-        "INSERT INTO orders(user_id, product, price) VALUES (?, ?, ?)",
-        (
-            user_id,
-            payment.invoice_payload,
-            payment.total_amount
-        )
-    )
-    db.commit()
-
-    order_id = db.execute(
-        "SELECT last_insert_rowid()"
-    ).fetchone()[0]
-
-    await message.answer(
-        f"💙 Оплата прошла успешно!\n\n"
-        f"🧾 Заказ №{order_id}\n"
-        f"⭐ Оплачено: {payment.total_amount} Stars\n\n"
-        "Заказ сохранён. Администратор свяжется с тобой "
-        "для получения товара."
-    )
-
-    for admin_id in ADMIN_IDS:
-        try:
-            await bot.send_message(
-                admin_id,
-                f"💰 <b>Новый заказ METROSHOP!</b>\n\n"
-                f"🧾 Заказ: #{order_id}\n"
-                f"👤 Покупатель: {user_id}\n"
-                f"📦 Товар: {payment.invoice_payload}\n"
-                f"⭐ Сумма: {payment.total_amount}",
-                parse_mode="HTML"
+        if not await check_subscription(context, user.id):
+            await query.message.reply_text(
+                "❌ Подписка пока не найдена. "
+                "Вступи в группу и попробуй снова.",
+                reply_markup=subscription_keyboard(),
             )
-        except Exception:
-            logging.exception("Не удалось уведомить администратора")
+            return
 
-
-# =========================
-# АДМИН-ПАНЕЛЬ
-# =========================
-
-@dp.message(Command("admin"))
-async def admin(message: Message):
-    if message.from_user.id not in ADMIN_IDS:
-        await message.answer("⛔ Нет доступа.")
+        await query.message.reply_text(
+            "✅ Подписка подтверждена!"
+        )
+        await show_main(update, context)
         return
 
-    total_orders = db.execute(
-        "SELECT COUNT(*) FROM orders"
-    ).fetchone()[0]
+    if is_blocked(user.id):
+        await query.answer(
+            "Доступ ограничен.",
+            show_alert=True,
+        )
+        return
 
-    total_stars = db.execute(
-        "SELECT COALESCE(SUM(price), 0) FROM orders"
-    ).fetchone()[0]
+    if not await require_subscription(update, context):
+        return
 
-    total_users = db.execute(
-        "SELECT COUNT(*) FROM users"
-    ).fetchone()[0]
+    await query.answer()
+    log_action(user.id, data)
 
-    await message.answer(
-        "👑 <b>METROSHOP ADMIN</b>\n\n"
-        f"👥 Пользователей: {total_users}\n"
-        f"📦 Заказов: {total_orders}\n"
-        f"⭐ Получено Stars: {total_stars}\n\n"
-        "Команды:\n"
-        "/orders — последние заказы\n"
-        "/users — количество пользователей",
-        parse_mode="HTML"
+    if data == "home":
+        await show_main(update, context)
+
+    elif data == "nick":
+        nick = generate_nick()
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton(
+                "🔄 Ещё ник",
+                callback_data="nick",
+            )],
+            [InlineKeyboardButton(
+                "⭐ В избранное",
+                callback_data=f"save_nick:{nick}",
+            )],
+            [InlineKeyboardButton(
+                "⬅️ Главное меню",
+                callback_data="home",
+            )],
+        ])
+        await query.edit_message_text(
+            f"🎭 Твой никнейм:\n\n`{nick}`",
+            parse_mode="Markdown",
+            reply_markup=keyboard,
+        )
+
+    elif data.startswith("save_nick:"):
+        value = data.split(":", 1)[1]
+        with db() as conn:
+            conn.execute("""
+                INSERT INTO favorites (user_id, value, created_at)
+                VALUES (?, ?, ?)
+            """, (
+                user.id,
+                value,
+                datetime.now(timezone.utc).isoformat(),
+            ))
+        await query.answer("⭐ Сохранено!", show_alert=True)
+
+    elif data == "history":
+        with db() as conn:
+            rows = conn.execute("""
+                SELECT action, details, created_at
+                FROM history
+                WHERE user_id = ?
+                ORDER BY id DESC
+                LIMIT 10
+            """, (user.id,)).fetchall()
+
+        if not rows:
+            text = "📋 История пока пуста."
+        else:
+            lines = ["📋 Последние действия:\n"]
+            for action, details, created in rows:
+                lines.append(
+                    f"• {action}: {details or '—'}\n"
+                    f"  {created[:16]}"
+                )
+            text = "\n".join(lines)
+
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton(
+                "🗑 Очистить историю",
+                callback_data="clear_history",
+            )],
+            [InlineKeyboardButton(
+                "⬅️ Назад",
+                callback_data="home",
+            )],
+        ])
+        await query.edit_message_text(text, reply_markup=keyboard)
+
+    elif data == "clear_history":
+        with db() as conn:
+            conn.execute(
+                "DELETE FROM history WHERE user_id = ?",
+                (user.id,),
+            )
+        await query.edit_message_text(
+            "🗑 История очищена.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton(
+                    "⬅️ Главное меню",
+                    callback_data="home",
+                )
+            ]]),
+        )
+
+    elif data == "favorites":
+        with db() as conn:
+            rows = conn.execute("""
+                SELECT id, value
+                FROM favorites
+                WHERE user_id = ?
+                ORDER BY id DESC
+                LIMIT 15
+            """, (user.id,)).fetchall()
+
+        if not rows:
+            text = "⭐ Избранное пока пусто."
+        else:
+            text = "⭐ Избранное:\n\n" + "\n".join(
+                f"{i}. {value}" for i, value in rows
+            )
+
+        await query.edit_message_text(
+            text,
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton(
+                    "⬅️ Главное меню",
+                    callback_data="home",
+                )
+            ]]),
+        )
+
+    elif data == "profile":
+        with db() as conn:
+            count = conn.execute(
+                "SELECT COUNT(*) FROM history WHERE user_id = ?",
+                (user.id,),
+            ).fetchone()[0]
+
+        await query.edit_message_text(
+            f"👤 ПРОФИЛЬ\n\n"
+            f"ID: {user.id}\n"
+            f"Имя: {user.first_name or '—'}\n"
+            f"Username: @{user.username or 'не указан'}\n"
+            f"Количество действий: {count}",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton(
+                    "⬅️ Главное меню",
+                    callback_data="home",
+                )
+            ]]),
+        )
+
+    elif data in ("data", "security", "webtools"):
+        messages = {
+            "data": (
+                "🔎 DATA HUNTER\n\n"
+                "Раздел предназначен для поиска по открытым "
+                "источникам. Поиск пока не подключён."
+            ),
+            "security": (
+                "🛡 SECURITY CENTER\n\n"
+                "Раздел предназначен для проверки подозрительных "
+                "ссылок. Анализ пока не подключён."
+            ),
+            "webtools": (
+                "🌐 WEB TOOLS\n\n"
+                "Здесь можно будет добавить проверку DNS, SSL "
+                "и HTTP-статусов сайтов."
+            ),
+        }
+        await query.edit_message_text(
+            messages[data],
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton(
+                    "⬅️ Главное меню",
+                    callback_data="home",
+                )
+            ]]),
+        )
+
+    elif data == "stats":
+        with db() as conn:
+            users = conn.execute(
+                "SELECT COUNT(*) FROM users"
+            ).fetchone()[0]
+            actions = conn.execute(
+                "SELECT COUNT(*) FROM history"
+            ).fetchone()[0]
+
+        await query.edit_message_text(
+            f"📊 СТАТИСТИКА БОТА\n\n"
+            f"👥 Пользователей: {users}\n"
+            f"🔎 Всего действий: {actions}",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton(
+                    "⬅️ Главное меню",
+                    callback_data="home",
+                )
+            ]]),
+        )
+
+    elif data == "admin":
+        if user.id not in ADMIN_IDS:
+            await query.answer("Нет доступа.", show_alert=True)
+            return
+
+        await query.edit_message_text(
+            "👑 АДМИН-ПАНЕЛЬ\n\nВыбери действие:",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton(
+                    "📊 Статистика",
+                    callback_data="stats",
+                )],
+                [InlineKeyboardButton(
+                    "📢 Рассылка",
+                    callback_data="broadcast",
+                )],
+                [InlineKeyboardButton(
+                    "🚫 Заблокировать пользователя",
+                    callback_data="block_help",
+                )],
+                [InlineKeyboardButton(
+                    "⬅️ Главное меню",
+                    callback_data="home",
+                )],
+            ]),
+        )
+
+    elif data == "broadcast":
+        if user.id not in ADMIN_IDS:
+            return
+
+        context.user_data["awaiting_broadcast"] = True
+        await query.message.reply_text(
+            "📢 Отправь текст рассылки следующим сообщением."
+        )
+
+    elif data == "block_help":
+        await query.edit_message_text(
+            "Используй команду:\n/block USER_ID\n\n"
+            "Для разблокировки:\n/unblock USER_ID",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton(
+                    "⬅️ Главное меню",
+                    callback_data="home",
+                )
+            ]]),
+        )
+
+
+# =========================
+# ADMIN COMMANDS
+# =========================
+
+async def block_command(update, context):
+    if update.effective_user.id not in ADMIN_IDS:
+        return
+
+    if not context.args or not context.args[0].isdigit():
+        await update.effective_message.reply_text(
+            "Использование: /block USER_ID"
+        )
+        return
+
+    target = int(context.args[0])
+    with db() as conn:
+        exists = conn.execute(
+            "SELECT user_id FROM users WHERE user_id = ?",
+            (target,),
+        ).fetchone()
+
+    if not exists:
+        await update.effective_message.reply_text(
+            "Пользователь не найден в базе."
+        )
+        return
+
+    set_blocked(target, True)
+    await update.effective_message.reply_text(
+        f"🚫 Пользователь {target} заблокирован."
     )
 
 
-@dp.message(Command("orders"))
-async def orders(message: Message):
-    if message.from_user.id not in ADMIN_IDS:
+async def unblock_command(update, context):
+    if update.effective_user.id not in ADMIN_IDS:
         return
 
-    rows = db.execute(
-        "SELECT id, user_id, product, price "
-        "FROM orders ORDER BY id DESC LIMIT 20"
-    ).fetchall()
-
-    if not rows:
-        await message.answer("Пока заказов нет.")
-        return
-
-    text = "📦 <b>Последние заказы</b>\n\n"
-
-    for order_id, user_id, product, price in rows:
-        text += (
-            f"#{order_id} | Пользователь: {user_id}\n"
-            f"Товар: {product} | {price} ⭐\n\n"
+    if not context.args or not context.args[0].isdigit():
+        await update.effective_message.reply_text(
+            "Использование: /unblock USER_ID"
         )
-
-    await message.answer(text, parse_mode="HTML")
-
-
-@dp.message(Command("users"))
-async def users(message: Message):
-    if message.from_user.id not in ADMIN_IDS:
         return
 
-    count = db.execute(
-        "SELECT COUNT(*) FROM users"
-    ).fetchone()[0]
+    target = int(context.args[0])
+    set_blocked(target, False)
+    await update.effective_message.reply_text(
+        f"✅ Пользователь {target} разблокирован."
+    )
 
-    await message.answer(f"👥 Пользователей: {count}")
+
+async def text_handler(update, context):
+    user = update.effective_user
+    if not user:
+        return
+
+    if is_blocked(user.id):
+        return
+
+    if not await require_subscription(update, context):
+        return
+
+    if context.user_data.pop("awaiting_broadcast", False):
+        if user.id not in ADMIN_IDS:
+            return
+
+        sent = 0
+        failed = 0
+
+        with db() as conn:
+            users = conn.execute(
+                "SELECT user_id FROM users WHERE blocked = 0"
+            ).fetchall()
+
+        for (target_id,) in users:
+            try:
+                await context.bot.send_message(
+                    target_id,
+                    update.effective_message.text,
+                )
+                sent += 1
+            except Exception:
+                failed += 1
+
+        await update.effective_message.reply_text(
+            f"📢 Рассылка завершена.\n"
+            f"Отправлено: {sent}\n"
+            f"Не отправлено: {failed}"
+        )
+        return
+
+    await update.effective_message.reply_text(
+        "Используй кнопки главного меню или команду /start."
+    )
 
 
 # =========================
-# ЗАПУСК
+# ERROR HANDLER
 # =========================
-from aiogram.webhook.aiohttp_server import (
-    SimpleRequestHandler,
-    setup_application,
-)
+
+async def error_handler(update, context):
+    logger.error(
+        "Update processing failed",
+        exc_info=context.error,
+    )
+
+
+# =========================
+# MAIN
+# =========================
 
 def main():
-    app = web.Application()
-
-    SimpleRequestHandler(
-        dispatcher=dp,
-        bot=bot,
-        secret_token=WEBHOOK_SECRET,
-    ).register(app, path=WEBHOOK_PATH)
-
-    setup_application(app, dp, bot=bot)
-
-    async def on_startup(app):
-        if not WEBHOOK_SECRET or not os.getenv("RENDER_EXTERNAL_URL"):
-            raise RuntimeError("Webhook settings are missing")
-
-        await bot.set_webhook(
-            WEBHOOK_URL,
-            secret_token=WEBHOOK_SECRET,
+    if not BOT_TOKEN:
+        raise RuntimeError(
+            "Не задан BOT_TOKEN в переменных окружения."
         )
 
-    app.on_startup.append(on_startup)
+    init_db()
 
-    web.run_app(
-        app,
-        host="0.0.0.0",
-        port=int(os.getenv("PORT", "10000")),
+    app = Application.builder().token(BOT_TOKEN).build()
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("block", block_command))
+    app.add_handler(CommandHandler("unblock", unblock_command))
+    app.add_handler(CallbackQueryHandler(callbacks))
+    app.add_handler(
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND,
+            text_handler,
+        )
     )
+    app.add_error_handler(error_handler)
+
+    logger.info("PROTIVZLA ULTIMATE started")
+    app.run_polling(drop_pending_updates=True)
 
 
 if __name__ == "__main__":
