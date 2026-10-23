@@ -1,2178 +1,1842 @@
+import asyncio
+import html
+import logging
 import os
-import re
-import ssl
 import random
 import sqlite3
-import logging
-import socket
-from datetime import datetime, timezone
-from urllib.parse import urlparse
-from html.parser import HTMLParser
+import string
+import time
+from datetime import datetime
+from pathlib import Path
 
-import httpx
-from telegram import (
-    Update,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
+from aiogram import Bot, Dispatcher, F
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
+from aiogram.exceptions import TelegramAPIError, TelegramForbiddenError
+from aiogram.filters import CommandStart, Command
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.types import (
+    Message,
+    CallbackQuery,
     ReplyKeyboardMarkup,
     KeyboardButton,
-    LabeledPrice,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
 )
-from telegram.constants import ChatMemberStatus
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    CallbackQueryHandler,
-    MessageHandler,
-    PreCheckoutQueryHandler,
-    ContextTypes,
-    filters,
-)
+from aiogram.utils.keyboard import InlineKeyboardBuilder
 
-# ================= CONFIG =================
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+# ==================== НАСТРОЙКИ ====================
 
-ADMIN_IDS = {
-    int(x.strip())
-    for x in os.getenv("ADMIN_IDS", "").split(",")
-    if x.strip().isdigit()
-}
+TOKEN = os.getenv("BOT_TOKEN", "").strip()
+OWNER_ID = int(os.getenv("OWNER_ID", "0"))
+DB_PATH = os.getenv("DB_PATH", "protivzla.db")
+SUPPORT = os.getenv("SUPPORT_USERNAME", "@suqexo")
+DELAY = max(0.05, float(os.getenv("BROADCAST_DELAY", "0.08")))
 
-REQUIRED_CHAT = os.getenv("REQUIRED_CHAT", "@ProtivzlaNFT")
-REQUIRED_CHAT_URL = os.getenv(
-    "REQUIRED_CHAT_URL",
-    "https://t.me/ProtivzlaNFT",
-)
+if not TOKEN or not OWNER_ID:
+    raise RuntimeError(
+        "Задайте переменные окружения BOT_TOKEN и OWNER_ID."
+    )
 
-DB_PATH = os.getenv("DB_PATH", "bot.db")
-
+Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-# ================= DATABASE =================
-
-def get_db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
 
 
-def init_db():
-    with get_db() as db:
-        db.executescript("""
-        CREATE TABLE IF NOT EXISTS users (
-            user_id INTEGER PRIMARY KEY,
+# ==================== БАЗА ДАННЫХ ====================
+
+def db():
+    connection = sqlite3.connect(DB_PATH, timeout=30)
+    connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA journal_mode=WAL")
+    return connection
+
+
+def ts():
+    return int(time.time())
+
+
+def own(uid):
+    return uid == OWNER_ID
+
+
+def audit(action, details=""):
+    with db() as c:
+        c.execute(
+            "INSERT INTO audit(action,details,ts) VALUES(?,?,?)",
+            (action, details[:500], ts()),
+        )
+
+
+def init():
+    with db() as c:
+        c.executescript("""
+        CREATE TABLE IF NOT EXISTS users(
+            id INTEGER PRIMARY KEY,
             username TEXT,
-            first_name TEXT,
-            joined_at TEXT,
-            blocked INTEGER DEFAULT 0
+            name TEXT,
+            joined INTEGER,
+            seen INTEGER,
+            blocked INTEGER DEFAULT 0,
+            points INTEGER DEFAULT 0,
+            vip TEXT DEFAULT 'Обычный',
+            daily INTEGER DEFAULT 0
         );
 
-        CREATE TABLE IF NOT EXISTS actions (
+        CREATE TABLE IF NOT EXISTS products(
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
+            title TEXT,
+            description TEXT,
+            price INTEGER,
+            active INTEGER DEFAULT 1
+        );
+
+        CREATE TABLE IF NOT EXISTS favorites(
+            uid INTEGER,
+            type TEXT,
+            item TEXT,
+            title TEXT,
+            ts INTEGER,
+            PRIMARY KEY(uid,type,item)
+        );
+
+        CREATE TABLE IF NOT EXISTS orders(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            uid INTEGER,
+            title TEXT,
+            price INTEGER,
+            status TEXT,
+            ts INTEGER
+        );
+
+        CREATE TABLE IF NOT EXISTS tickets(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            uid INTEGER,
+            msg TEXT,
+            status TEXT DEFAULT 'Открыто',
+            ts INTEGER
+        );
+
+        CREATE TABLE IF NOT EXISTS promos(
+            code TEXT PRIMARY KEY,
+            bonus INTEGER,
+            maxuses INTEGER,
+            uses INTEGER DEFAULT 0,
+            active INTEGER DEFAULT 1
+        );
+
+        CREATE TABLE IF NOT EXISTS promo_uses(
+            code TEXT,
+            uid INTEGER,
+            PRIMARY KEY(code,uid)
+        );
+
+        CREATE TABLE IF NOT EXISTS broadcasts(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            kind TEXT,
+            body TEXT,
+            photo TEXT DEFAULT '',
+            btn TEXT DEFAULT '',
+            url TEXT DEFAULT '',
+            status TEXT,
+            scheduled INTEGER DEFAULT 0,
+            created INTEGER,
+            sent INTEGER DEFAULT 0,
+            failed INTEGER DEFAULT 0
+        );
+
+        CREATE TABLE IF NOT EXISTS audit(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
             action TEXT,
             details TEXT,
-            created_at TEXT
-        );
-
-        CREATE TABLE IF NOT EXISTS promos (
-            code TEXT PRIMARY KEY,
-            bonus TEXT,
-            max_uses INTEGER DEFAULT 1,
-            uses INTEGER DEFAULT 0,
-            expires_at TEXT,
-            active INTEGER DEFAULT 1
-        );
-
-        CREATE TABLE IF NOT EXISTS promo_uses (
-            user_id INTEGER,
-            code TEXT,
-            used_at TEXT,
-            PRIMARY KEY(user_id, code)
-        );
-
-        CREATE TABLE IF NOT EXISTS favorites (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            kind TEXT,
-            value TEXT,
-            created_at TEXT,
-            UNIQUE(user_id, kind, value)
-        );
-
-        CREATE TABLE IF NOT EXISTS products (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT,
-            description TEXT,
-            price_stars INTEGER DEFAULT 0,
-            active INTEGER DEFAULT 1
-        );
-
-        CREATE TABLE IF NOT EXISTS orders (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            product_id INTEGER,
-            product_name TEXT,
-            price_stars INTEGER,
-            status TEXT DEFAULT 'created',
-            created_at TEXT,
-            telegram_payment_charge_id TEXT UNIQUE
-        );
-
-        CREATE TABLE IF NOT EXISTS tickets (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            message TEXT,
-            status TEXT DEFAULT 'open',
-            created_at TEXT
-        );
-
-        CREATE TABLE IF NOT EXISTS admins (
-            user_id INTEGER PRIMARY KEY
+            ts INTEGER
         );
         """)
 
-        for admin_id in ADMIN_IDS:
-            db.execute(
-                "INSERT OR IGNORE INTO admins(user_id) VALUES(?)",
-                (admin_id,),
+        if not c.execute(
+            "SELECT COUNT(*) FROM products"
+        ).fetchone()[0]:
+            c.executemany(
+                "INSERT INTO products(title,description,price) "
+                "VALUES(?,?,?)",
+                [
+                    (
+                        "Демо-товар 1",
+                        "Замените описание на свой товар.",
+                        100,
+                    ),
+                    (
+                        "Демо-товар 2",
+                        "Пример карточки товара.",
+                        250,
+                    ),
+                ],
             )
 
 
-def now():
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
-
-
-def save_user(user):
-    with get_db() as db:
-        db.execute("""
-            INSERT INTO users(user_id, username, first_name, joined_at)
-            VALUES (?, ?, ?, ?)
-            ON CONFLICT(user_id) DO UPDATE SET
+def reg(user):
+    with db() as c:
+        c.execute("""
+            INSERT INTO users(id,username,name,joined,seen)
+            VALUES(?,?,?,?,?)
+            ON CONFLICT(id) DO UPDATE SET
                 username=excluded.username,
-                first_name=excluded.first_name
+                name=excluded.name,
+                seen=excluded.seen
         """, (
             user.id,
             user.username or "",
             user.first_name or "",
-            now(),
+            ts(),
+            ts(),
         ))
 
 
-def log_action(user_id, action, details=""):
-    with get_db() as db:
-        db.execute("""
-            INSERT INTO actions(user_id, action, details, created_at)
-            VALUES (?, ?, ?, ?)
-        """, (user_id, action, str(details)[:500], now()))
+# ==================== КЛАВИАТУРЫ ====================
 
+def ik(rows):
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
-def is_admin(user_id):
-    with get_db() as db:
-        return db.execute(
-            "SELECT 1 FROM admins WHERE user_id=?",
-            (user_id,),
-        ).fetchone() is not None
 
-
-def is_blocked(user_id):
-    with get_db() as db:
-        row = db.execute(
-            "SELECT blocked FROM users WHERE user_id=?",
-            (user_id,),
-        ).fetchone()
-
-    return bool(row and row["blocked"])
-
-
-# ================= MAIN MENU =================
-
-MAIN_MENU = [
-    [
-        KeyboardButton("🔎 DATA HUNTER"),
-        KeyboardButton("🌐 WEB TOOLS"),
-    ],
-    [
-        KeyboardButton("🛡️ SECURITY CENTER"),
-        KeyboardButton("🎁 GIFTS SHOP"),
-    ],
-    [
-        KeyboardButton("🛍️ PROTIVZLA SHOP"),
-        KeyboardButton("👤 USER PROFILE"),
-    ],
-    [
-        KeyboardButton("💬 SUPPORT"),
-        KeyboardButton("👑 ADMIN PANEL"),
-    ],
-    [
-        KeyboardButton("🎟️ PROMO CODES"),
-        KeyboardButton("📊 STATISTICS"),
-    ],
-    [
-        KeyboardButton("📜 ACTION HISTORY"),
-        KeyboardButton("🎭 USERNAME GENERATOR"),
-    ],
-    [
-        KeyboardButton("⭐ FAVORITES"),
-    ],
-]
-
-MAIN_MARKUP = ReplyKeyboardMarkup(
-    MAIN_MENU,
-    resize_keyboard=True,
-)
-
-
-def make_inline(rows):
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton(label, callback_data=data)
-            for label, data in row
-        ]
-        for row in rows
-    ])
-
-
-# ================= SUBSCRIPTION =================
-
-async def check_subscription(update, context):
-    user = update.effective_user
-
-    try:
-        member = await context.bot.get_chat_member(
-            REQUIRED_CHAT,
-            user.id,
-        )
-
-        if member.status in (
-            ChatMemberStatus.MEMBER,
-            ChatMemberStatus.ADMINISTRATOR,
-            ChatMemberStatus.OWNER,
-        ):
-            return True
-
-    except Exception:
-        logger.exception("Subscription check failed")
-
-    message = (
-        "💚 Чтобы пользоваться ботом, подпишись на канал "
-        "и нажми «Проверить подписку»."
-    )
-
-    keyboard = make_inline([
-        [("📢 Подписаться", "subscribe")],
-        [("✅ Проверить подписку", "check_subscription")],
-    ])
-
-    if update.callback_query:
-        await update.callback_query.message.reply_text(
-            message,
-            reply_markup=keyboard,
-        )
-    else:
-        await update.effective_message.reply_text(
-            message,
-            reply_markup=keyboard,
-        )
-
-    return False
-
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    save_user(user)
-
-    if is_blocked(user.id):
-        await update.effective_message.reply_text(
-            "⛔ Доступ к боту ограничен."
-        )
-        return
-
-    log_action(user.id, "start")
-
-    if not await check_subscription(update, context):
-        return
-
-    await update.effective_message.reply_text(
-        f"💚 Добро пожаловать, {user.first_name}!\n\n"
-        "PROTIVZLA ULTIMATE\n"
-        "Выбери нужный раздел:",
-        reply_markup=MAIN_MARKUP,
-    )
-
-
-async def ensure_access(update, context):
-    user = update.effective_user
-
-    if not user:
-        return False
-
-    save_user(user)
-
-    if is_blocked(user.id):
-        await update.effective_message.reply_text(
-            "⛔ Доступ к боту ограничен."
-        )
-        return False
-
-    return await check_subscription(update, context)
-    
-# =========================
-# PART 2/3 — FEATURES
-# =========================
-
-import html
-import secrets
-import string
-from urllib.parse import quote_plus
-
-
-# ---------- PUBLIC WEB SEARCH ----------
-
-async def public_web_search(query: str, limit: int = 5):
-    """Поиск только по общедоступным страницам интернета."""
-    results = []
-
-    try:
-        async with httpx.AsyncClient(
-            timeout=12,
-            follow_redirects=True,
-            headers={"User-Agent": "Mozilla/5.0"}
-        ) as client:
-            response = await client.get(
-                "https://html.duckduckgo.com/html/",
-                params={"q": query}
-            )
-            response.raise_for_status()
-
-        class ResultParser(HTMLParser):
-            def __init__(self):
-                super().__init__()
-                self.items = []
-                self.current = None
-                self.capture_title = False
-
-            def handle_starttag(self, tag, attrs):
-                attrs = dict(attrs)
-
-                if tag == "a" and "result__a" in attrs.get("class", ""):
-                    self.current = {
-                        "title": "",
-                        "url": attrs.get("href", "")
-                    }
-                    self.capture_title = True
-
-            def handle_data(self, data):
-                if self.current and self.capture_title:
-                    self.current["title"] += data
-
-            def handle_endtag(self, tag):
-                if tag == "a" and self.current and self.capture_title:
-                    self.items.append(self.current)
-                    self.current = None
-                    self.capture_title = False
-
-        parser = ResultParser()
-        parser.feed(response.text)
-        results = parser.items[:limit]
-
-    except Exception as exc:
-        logging.warning("Web search error: %s", exc)
-
-    return results
-
-
-# ---------- USER PROFILE ----------
-
-async def show_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-
-    with get_db() as db:
-        row = db.execute(
-            "SELECT created_at FROM users WHERE user_id = ?",
-            (user.id,)
-        ).fetchone()
-
-        action_count = db.execute(
-            "SELECT COUNT(*) FROM actions WHERE user_id = ?",
-            (user.id,)
-        ).fetchone()[0]
-
-        favorites_count = db.execute(
-            "SELECT COUNT(*) FROM favorites WHERE user_id = ?",
-            (user.id,)
-        ).fetchone()[0]
-
-        orders_count = db.execute(
-            "SELECT COUNT(*) FROM orders WHERE user_id = ?",
-            (user.id,)
-        ).fetchone()[0]
-
-    joined = row["created_at"] if row else "неизвестно"
-
-    text = (
-        "👤 <b>ТВОЙ ПРОФИЛЬ</b>\n\n"
-        f"🆔 ID: <code>{user.id}</code>\n"
-        f"👤 Имя: {html.escape(user.full_name)}\n"
-        f"🔗 Username: @{html.escape(user.username or 'нет')}\n"
-        f"📅 В системе с: {html.escape(str(joined))}\n\n"
-        f"📊 Действий: {action_count}\n"
-        f"⭐ Избранное: {favorites_count}\n"
-        f"🛒 Заказов: {orders_count}"
-    )
-
-    await update.effective_message.reply_text(
-        text,
-        parse_mode="HTML"
-    )
-
-
-# ---------- ACTION HISTORY ----------
-
-async def show_history(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-    user_id = update.effective_user.id
-
-    with get_db() as db:
-        rows = db.execute(
-            """
-            SELECT action, details, created_at
-            FROM actions
-            WHERE user_id = ?
-            ORDER BY id DESC
-            LIMIT 10
-            """,
-            (user_id,)
-        ).fetchall()
-
-    if not rows:
-        await update.effective_message.reply_text(
-            "📜 История пока пустая."
-        )
-        return
-
-    lines = ["📜 <b>ПОСЛЕДНИЕ ДЕЙСТВИЯ</b>\n"]
-
-    for row in rows:
-        action = html.escape(str(row["action"]))
-        details = html.escape(str(row["details"] or ""))
-        created = html.escape(str(row["created_at"]))
-
-        lines.append(
-            f"• <b>{action}</b>\n"
-            f"  {details}\n"
-            f"  <i>{created}</i>"
-        )
-
-    await update.effective_message.reply_text(
-        "\n\n".join(lines),
-        parse_mode="HTML"
-    )
-
-
-# ---------- STATISTICS ----------
-
-async def show_statistics(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-    with get_db() as db:
-        users = db.execute(
-            "SELECT COUNT(*) FROM users"
-        ).fetchone()[0]
-
-        actions = db.execute(
-            "SELECT COUNT(*) FROM actions"
-        ).fetchone()[0]
-
-        products = db.execute(
-            "SELECT COUNT(*) FROM products WHERE active = 1"
-        ).fetchone()[0]
-
-        orders = db.execute(
-            "SELECT COUNT(*) FROM orders"
-        ).fetchone()[0]
-
-    await update.effective_message.reply_text(
-        "📊 <b>СТАТИСТИКА PROTIVZLA</b>\n\n"
-        f"👥 Пользователей: {users}\n"
-        f"⚡ Действий: {actions}\n"
-        f"🛍 Активных товаров: {products}\n"
-        f"📦 Заказов: {orders}",
-        parse_mode="HTML"
-    )
-
-
-# ---------- USERNAME GENERATOR ----------
-
-def generate_username(length: int = 10) -> str:
-    """Создаёт случайный вариант username."""
-    length = max(5, min(length, 20))
-
-    alphabet = string.ascii_lowercase + string.digits
-    first = secrets.choice(string.ascii_lowercase)
-
-    return first + "".join(
-        secrets.choice(alphabet)
-        for _ in range(length - 1)
-    )
-
-
-async def username_generator(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-    usernames = [generate_username() for _ in range(5)]
-
-    keyboard = [
+def back():
+    return ik([
         [
             InlineKeyboardButton(
-                f"⭐ {username}",
-                callback_data=f"fav_username:{username}"
+                text="⬅️ Назад",
+                callback_data="adm:home",
             )
         ]
-        for username in usernames
-    ]
+    ])
 
-    await update.effective_message.reply_text(
-        "🎲 <b>ГЕНЕРАТОР USERNAME</b>\n\n"
-        "Вот пять случайных вариантов.\n"
-        "Нажми на понравившийся, чтобы сохранить его.\n\n"
-        "⚠️ Доступность этих имён в Telegram не проверяется.",
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup(keyboard)
+
+def menu():
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [
+                KeyboardButton(text="🛍️ Магазин"),
+                KeyboardButton(text="🎁 Подарки"),
+            ],
+            [
+                KeyboardButton(text="⭐ Генератор"),
+                KeyboardButton(text="❤️ Избранное"),
+            ],
+            [
+                KeyboardButton(text="👤 Профиль"),
+                KeyboardButton(text="🎟️ Промокод"),
+            ],
+            [
+                KeyboardButton(text="🎁 Ежедневная награда"),
+                KeyboardButton(text="💎 VIP"),
+            ],
+            [
+                KeyboardButton(text="🎧 Поддержка"),
+                KeyboardButton(text="ℹ️ Информация"),
+            ],
+        ],
+        resize_keyboard=True,
     )
 
 
-# ---------- FAVORITES ----------
+def adm_menu():
+    builder = InlineKeyboardBuilder()
 
-async def add_favorite(
-    user_id: int,
-    kind: str,
-    value: str
-) -> bool:
-    with get_db() as db:
-        exists = db.execute(
-            """
-            SELECT id FROM favorites
-            WHERE user_id = ? AND kind = ? AND value = ?
-            """,
-            (user_id, kind, value)
-        ).fetchone()
+    buttons = [
+        ("📊 Статистика", "stats"),
+        ("👥 Пользователи", "users"),
+        ("🛍️ Товары/заказы", "shop"),
+        ("🎟️ Промокоды", "promos"),
+        ("💎 VIP", "vip"),
+        ("🎧 Поддержка", "tickets"),
+        ("📢 Центр рассылок", "broadcast"),
+        ("🗄️ Резервная копия", "backup"),
+        ("📜 Журнал действий", "audit"),
+        ("⚙️ Настройки", "settings"),
+    ]
 
-        if exists:
-            return False
-
-        db.execute(
-            """
-            INSERT INTO favorites (user_id, kind, value)
-            VALUES (?, ?, ?)
-            """,
-            (user_id, kind, value)
+    for title, key in buttons:
+        builder.button(
+            text=title,
+            callback_data="adm:" + key,
         )
 
+    builder.adjust(2, 2, 2, 1, 1, 1, 1)
+    return builder.as_markup()
+
+
+# ==================== СОСТОЯНИЯ ====================
+
+class BC(StatesGroup):
+    body = State()
+    photo = State()
+    caption = State()
+    btn = State()
+    url = State()
+    schedule = State()
+    cancel_id = State()
+
+
+class Support(StatesGroup):
+    msg = State()
+
+
+class Promo(StatesGroup):
+    code = State()
+
+
+dp = Dispatcher()
+active = set()
+stop = set()
+
+
+# ==================== ПРОВЕРКА ВЛАДЕЛЬЦА ====================
+
+async def om(message):
+    if not own(message.from_user.id):
+        await message.answer("⛔ Доступ запрещён.")
+        return False
     return True
 
 
-async def show_favorites(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-    user_id = update.effective_user.id
-
-    with get_db() as db:
-        rows = db.execute(
-            """
-            SELECT id, kind, value
-            FROM favorites
-            WHERE user_id = ?
-            ORDER BY id DESC
-            LIMIT 30
-            """,
-            (user_id,)
-        ).fetchall()
-
-    if not rows:
-        await update.effective_message.reply_text(
-            "⭐ Избранное пока пустое."
+async def oc(callback):
+    if not own(callback.from_user.id):
+        await callback.answer(
+            "⛔ Доступ запрещён.",
+            show_alert=True,
         )
-        return
+        return False
+    return True
 
-    keyboard = []
 
-    for row in rows:
-        label = f"❌ {row['kind']}: {row['value']}"
-        keyboard.append([
-            InlineKeyboardButton(
-                label[:60],
-                callback_data=f"remove_fav:{row['id']}"
-            )
-        ])
+# ==================== СТАРТ ====================
 
-    await update.effective_message.reply_text(
-        "⭐ <b>ТВОЁ ИЗБРАННОЕ</b>\n"
-        "Нажми на запись, чтобы удалить её.",
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup(keyboard)
+@dp.message(CommandStart())
+async def start(message: Message, state: FSMContext):
+    await state.clear()
+    reg(message.from_user)
+
+    await message.answer(
+        f"👋 Привет, "
+        f"<b>{html.escape(message.from_user.first_name or 'пользователь')}</b>!\n"
+        "Добро пожаловать в <b>PROTIVZLA ULTIMATE</b>.",
+        reply_markup=menu(),
     )
 
 
-# ---------- PROMO CODES ----------
-
-async def show_promos(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-    await update.effective_message.reply_text(
-        "🎟 <b>ПРОМОКОДЫ</b>\n\n"
-        "Чтобы активировать код, отправь:\n"
-        "<code>/promo КОД</code>\n\n"
-        "Промокоды создаёт администратор.",
-        parse_mode="HTML"
+@dp.message(Command("cancel"))
+async def cancel(message: Message, state: FSMContext):
+    await state.clear()
+    await message.answer(
+        "Действие отменено.",
+        reply_markup=menu(),
     )
 
 
-async def redeem_promo(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-    if not context.args:
-        await update.effective_message.reply_text(
-            "Использование: /promo КОД"
-        )
-        return
+@dp.message(Command("admin"))
+async def admin(message: Message):
+    reg(message.from_user)
 
-    code = context.args[0].strip().upper()
-    user_id = update.effective_user.id
-
-    with get_db() as db:
-        promo = db.execute(
-            """
-            SELECT code, bonus, max_uses, used_count, expires_at, active
-            FROM promos
-            WHERE code = ?
-            """,
-            (code,)
-        ).fetchone()
-
-        if not promo or not promo["active"]:
-            await update.effective_message.reply_text(
-                "❌ Промокод не найден или отключён."
-            )
-            return
-
-        if promo["max_uses"] > 0 and promo["used_count"] >= promo["max_uses"]:
-            await update.effective_message.reply_text(
-                "❌ Лимит активаций исчерпан."
-            )
-            return
-
-        expires_at = promo["expires_at"]
-
-        if expires_at and str(expires_at) < now():
-            await update.effective_message.reply_text(
-                "❌ Срок действия промокода истёк."
-            )
-            return
-
-        already_used = db.execute(
-            """
-            SELECT id FROM promo_uses
-            WHERE user_id = ? AND code = ?
-            """,
-            (user_id, code)
-        ).fetchone()
-
-        if already_used:
-            await update.effective_message.reply_text(
-                "⚠️ Ты уже активировал этот промокод."
-            )
-            return
-
-        db.execute(
-            """
-            INSERT INTO promo_uses (user_id, code, used_at)
-            VALUES (?, ?, ?)
-            """,
-            (user_id, code, now())
-        )
-
-        db.execute(
-            """
-            UPDATE promos
-            SET used_count = used_count + 1
-            WHERE code = ?
-            """,
-            (code,)
-        )
-
-        db.execute(
-            """
-            INSERT INTO actions (user_id, action, details, created_at)
-            VALUES (?, ?, ?, ?)
-            """,
-            (user_id, "promo_redeem", code, now())
-        )
-
-    await update.effective_message.reply_text(
-        "✅ Промокод активирован!\n"
-        f"🎁 Бонус: {html.escape(str(promo['bonus']))}\n\n"
-        "ℹ️ Бонус отображается как информация. "
-        "Автоматическое начисление баланса не настроено.",
-        parse_mode="HTML"
-    )
-
-
-# ---------- DATA HUNTER: PUBLIC WEB ONLY ----------
-
-async def data_hunter(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-    await update.effective_message.reply_text(
-        "🔎 <b>DATA HUNTER</b>\n\n"
-        "Я могу искать публичные страницы в интернете.\n"
-        "Я не ищу закрытые базы, пароли, адреса или "
-        "личные данные частных лиц.\n\n"
-        "Отправь запрос командой:\n"
-        "<code>/search запрос</code>",
-        parse_mode="HTML"
-    )
-
-
-async def search_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-    if not context.args:
-        await update.effective_message.reply_text(
-            "Пример: /search официальный сайт Telegram"
-        )
-        return
-
-    query = " ".join(context.args).strip()[:200]
-
-    await update.effective_message.reply_text(
-        "🔎 Ищу публичные страницы..."
-    )
-
-    results = await public_web_search(query)
-
-    if not results:
-        await update.effective_message.reply_text(
-            "Не удалось получить результаты. "
-            "Попробуй другой запрос чуть позже."
-        )
-        return
-
-    lines = [f"🔎 <b>РЕЗУЛЬТАТЫ</b>\nЗапрос: {html.escape(query)}\n"]
-
-    for index, result in enumerate(results, start=1):
-        title = html.escape(result.get("title", "Без названия"))
-        url = html.escape(result.get("url", ""), quote=True)
-
-        lines.append(
-            f'{index}. <a href="{url}">{title}</a>'
-        )
-
-    await update.effective_message.reply_text(
-        "\n\n".join(lines),
-        parse_mode="HTML",
-        disable_web_page_preview=True
-    )
-
-
-# ---------- WEB TOOLS ----------
-
-async def web_tools(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-    await update.effective_message.reply_text(
-        "🌐 <b>WEB TOOLS</b>\n\n"
-        "Проверить доступность публичного сайта:\n"
-        "<code>/webcheck https://example.com</code>\n\n"
-        "Посмотреть DNS-записи домена:\n"
-        "<code>/dns example.com</code>\n\n"
-        "Проверить TLS-сертификат сайта:\n"
-        "<code>/ssl example.com</code>",
-        parse_mode="HTML"
-    )
-
-
-def normalize_domain(value: str):
-    value = value.strip()
-
-    if "://" not in value:
-        value = "https://" + value
-
-    parsed = urlparse(value)
-
-    if not parsed.hostname:
-        return None
-
-    hostname = parsed.hostname.lower()
-
-    if (
-        len(hostname) > 253
-        or not re.fullmatch(r"[a-z0-9.-]+", hostname)
-        or ".." in hostname
-        or hostname.startswith(".")
-        or hostname.endswith(".")
-    ):
-        return None
-
-    return parsed, hostname
-
-
-async def webcheck_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-    if not context.args:
-        await update.effective_message.reply_text(
-            "Пример: /webcheck https://example.com"
-        )
-        return
-
-    parsed_data = normalize_domain(context.args[0])
-
-    if not parsed_data:
-        await update.effective_message.reply_text(
-            "❌ Проверь адрес сайта."
-        )
-        return
-
-    parsed, hostname = parsed_data
-
-    if parsed.scheme not in ("http", "https"):
-        await update.effective_message.reply_text(
-            "❌ Поддерживаются только HTTP и HTTPS."
-        )
-        return
-
-    try:
-        async with httpx.AsyncClient(
-            timeout=10,
-            follow_redirects=True,
-            max_redirects=5
-        ) as client:
-            response = await client.get(
-                f"{parsed.scheme}://{hostname}{parsed.path or '/'}"
-            )
-
-        await update.effective_message.reply_text(
-            "🌐 <b>РЕЗУЛЬТАТ ПРОВЕРКИ</b>\n\n"
-            f"Домен: <code>{html.escape(hostname)}</code>\n"
-            f"HTTP-статус: <code>{response.status_code}</code>\n"
-            f"Финальный адрес: {html.escape(str(response.url))}",
-            parse_mode="HTML",
-            disable_web_page_preview=True
-        )
-
-    except Exception as exc:
-        logging.warning("Web check failed: %s", exc)
-
-        await update.effective_message.reply_text(
-            "⚠️ Сайт не ответил или соединение не удалось установить."
+    if await om(message):
+        await message.answer(
+            "👑 МЕГА-ПАНЕЛЬ PROTIVZLA",
+            reply_markup=adm_menu(),
         )
 
 
-async def dns_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-    if not context.args:
-        await update.effective_message.reply_text(
-            "Пример: /dns example.com"
-        )
-        return
+# ==================== МАГАЗИН ====================
 
-    parsed_data = normalize_domain(context.args[0])
+@dp.message(F.text == "🛍️ Магазин")
+async def shop(message: Message):
+    reg(message.from_user)
 
-    if not parsed_data:
-        await update.effective_message.reply_text(
-            "❌ Неверный домен."
-        )
-        return
-
-    _, hostname = parsed_data
-
-    try:
-        loop = asyncio.get_running_loop()
-        infos = await loop.getaddrinfo(
-            hostname,
-            None,
-            type=socket.SOCK_STREAM
-        )
-
-        addresses = sorted({
-            info[4][0]
-            for info in infos
-        })
-
-        await update.effective_message.reply_text(
-            "🧭 <b>DNS-РЕЗУЛЬТАТ</b>\n\n"
-            f"Домен: <code>{html.escape(hostname)}</code>\n"
-            + "\n".join(
-                f"• <code>{html.escape(address)}</code>"
-                for address in addresses
-            ),
-            parse_mode="HTML"
-        )
-
-    except Exception:
-        await update.effective_message.reply_text(
-            "⚠️ Не удалось получить DNS-адреса."
-        )
-
-
-async def ssl_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-    if not context.args:
-        await update.effective_message.reply_text(
-            "Пример: /ssl example.com"
-        )
-        return
-
-    parsed_data = normalize_domain(context.args[0])
-
-    if not parsed_data:
-        await update.effective_message.reply_text(
-            "❌ Неверный домен."
-        )
-        return
-
-    _, hostname = parsed_data
-
-    def get_certificate():
-        with socket.create_connection(
-            (hostname, 443),
-            timeout=8
-        ) as sock:
-            with ssl.create_default_context().wrap_socket(
-                sock,
-                server_hostname=hostname
-            ) as secure_sock:
-                return secure_sock.getpeercert()
-
-    try:
-        cert = await asyncio.to_thread(get_certificate)
-
-        subject = dict(
-            item[0] for item in cert.get("subject", ())
-        )
-        issuer = dict(
-            item[0] for item in cert.get("issuer", ())
-        )
-
-        await update.effective_message.reply_text(
-            "🔐 <b>TLS-СЕРТИФИКАТ</b>\n\n"
-            f"Домен: <code>{html.escape(hostname)}</code>\n"
-            f"Выдан для: {html.escape(subject.get('commonName', '—'))}\n"
-            f"Издатель: {html.escape(issuer.get('organizationName', '—'))}\n"
-            f"Действует до: {html.escape(cert.get('notAfter', '—'))}",
-            parse_mode="HTML"
-        )
-
-    except Exception:
-        await update.effective_message.reply_text(
-            "⚠️ Не удалось проверить TLS-сертификат."
-        )
-
-
-# ---------- SECURITY CENTER ----------
-
-async def security_center(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-    await update.effective_message.reply_text(
-        "🛡 <b>SECURITY CENTER</b>\n\n"
-        "Доступные проверки:\n"
-        "• /webcheck — доступность сайта\n"
-        "• /dns — DNS-адреса домена\n"
-        "• /ssl — TLS-сертификат\n\n"
-        "Проверки предназначены для публичных сайтов "
-        "и обычной диагностики.",
-        parse_mode="HTML"
-    )
-
-
-# ---------- SHOP ----------
-
-async def show_shop(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-    with get_db() as db:
-        products = db.execute(
-            """
-            SELECT id, name, description, price
-            FROM products
-            WHERE active = 1
-            ORDER BY id DESC
-            LIMIT 20
-            """
+    with db() as c:
+        products = c.execute(
+            "SELECT * FROM products "
+            "WHERE active=1 ORDER BY id DESC"
         ).fetchall()
 
     if not products:
-        await update.effective_message.reply_text(
-            "🛍 Магазин пока пуст.\n"
-            "Администратор может добавить товары командой "
-            "/product_add."
-        )
+        await message.answer("Пока товаров нет.")
         return
-
-    keyboard = []
 
     for product in products:
-        keyboard.append([
-            InlineKeyboardButton(
-                f"{product['name']} — {product['price']} ⭐",
-                callback_data=f"product:{product['id']}"
+        await message.answer(
+            f"🛍️ <b>{html.escape(product['title'])}</b>\n"
+            f"{html.escape(product['description'])}\n"
+            f"Цена: {product['price']} баллов",
+            reply_markup=ik([
+                [
+                    InlineKeyboardButton(
+                        text="❤️ В избранное",
+                        callback_data=(
+                            f"fav:add:product:{product['id']}"
+                        ),
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        text="🛒 Оформить заказ",
+                        callback_data=f"order:{product['id']}",
+                    )
+                ],
+            ]),
+        )
+
+
+@dp.callback_query(F.data.startswith("order:"))
+async def order(callback: CallbackQuery):
+    reg(callback.from_user)
+    product_id = callback.data.split(":")[1]
+
+    with db() as c:
+        product = c.execute(
+            "SELECT * FROM products "
+            "WHERE id=? AND active=1",
+            (product_id,),
+        ).fetchone()
+
+        if not product:
+            await callback.answer(
+                "Товар недоступен.",
+                show_alert=True,
             )
-        ])
+            return
 
-    await update.effective_message.reply_text(
-        "🛍 <b>PROTIVZLA SHOP</b>\n\n"
-        "Выбери товар:",
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
-
-
-async def show_gifts_shop(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-    await update.effective_message.reply_text(
-        "🎁 <b>GIFTS SHOP</b>\n\n"
-        "Раздел подготовлен, но отправка Telegram-подарков "
-        "пока не подключена.\n\n"
-        "Бот не будет утверждать, что подарок отправлен, "
-        "если этого не произошло.",
-        parse_mode="HTML"
-    )
-
-
-# ---------- SUPPORT TICKETS ----------
-
-async def support_menu(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-    context.user_data["waiting_support_message"] = True
-
-    await update.effective_message.reply_text(
-        "🎧 <b>ПОДДЕРЖКА</b>\n\n"
-        "Отправь следующим сообщением свой вопрос. "
-        "Не указывай пароли и секретные коды.",
-        parse_mode="HTML"
-    )
-
-
-async def create_ticket(
-    user_id: int,
-    username: str,
-    message: str
-):
-    with get_db() as db:
-        cursor = db.execute(
-            """
-            INSERT INTO tickets
-                (user_id, username, message, status, created_at)
-            VALUES (?, ?, ?, ?, ?)
-            """,
+        order_id = c.execute(
+            "INSERT INTO orders(uid,title,price,status,ts) "
+            "VALUES(?,?,?,?,?)",
             (
-                user_id,
-                username,
-                message[:2000],
-                "open",
-                now()
-            )
+                callback.from_user.id,
+                product["title"],
+                product["price"],
+                "Новый",
+                ts(),
+            ),
+        ).lastrowid
+
+    await callback.answer("Заказ создан")
+
+    await callback.message.answer(
+        f"Заказ №{order_id} создан.\n"
+        "Это заявка: оплата пока не списана."
+    )
+
+    try:
+        await callback.bot.send_message(
+            OWNER_ID,
+            f"🛒 Заказ #{order_id}\n"
+            f"{html.escape(product['title'])}\n"
+            f"Пользователь: <code>{callback.from_user.id}</code>",
+        )
+    except TelegramAPIError:
+        pass
+
+
+# ==================== ИЗБРАННОЕ ====================
+
+@dp.callback_query(F.data.startswith("fav:add:"))
+async def favadd(callback: CallbackQuery):
+    reg(callback.from_user)
+
+    _, _, item_type, item = callback.data.split(":", 3)
+    title = item
+
+    if item_type == "product":
+        with db() as c:
+            product = c.execute(
+                "SELECT title FROM products WHERE id=?",
+                (item,),
+            ).fetchone()
+
+            if product:
+                title = product["title"]
+
+    with db() as c:
+        c.execute(
+            "INSERT OR IGNORE INTO favorites "
+            "VALUES(?,?,?,?,?)",
+            (
+                callback.from_user.id,
+                item_type,
+                item,
+                title,
+                ts(),
+            ),
         )
 
-        return cursor.lastrowid
-
-
-async def handle_support_message(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-    user = update.effective_user
-    message = update.effective_message
-
-    if not user or not message or not message.text:
-        return
-
-    ticket_id = await create_ticket(
-        user.id,
-        user.username or "",
-        message.text
+    await callback.answer(
+        "Добавлено в избранное ❤️",
+        show_alert=True,
     )
 
-    context.user_data.pop("waiting_support_message", None)
 
-    await message.reply_text(
-        f"✅ Обращение #{ticket_id} создано. "
-        "Поддержка рассмотрит его, когда администратор будет онлайн."
-    )
+@dp.callback_query(F.data.startswith("fav:del:"))
+async def favdel(callback: CallbackQuery):
+    _, _, item_type, item = callback.data.split(":", 3)
 
-    with get_db() as db:
-        admins = db.execute(
-            "SELECT user_id FROM admins"
-        ).fetchall()
-
-    for admin in admins:
-        try:
-            await context.bot.send_message(
-                chat_id=admin["user_id"],
-                text=(
-                    f"🎧 Новое обращение #{ticket_id}\n"
-                    f"От: {user.id} (@{user.username or 'нет'})\n\n"
-                    f"{message.text[:1500]}\n\n"
-                    f"Ответ: /ticket_reply {ticket_id} текст"
-                )
-            )
-        except Exception:
-            logging.warning(
-                "Could not notify admin %s",
-                admin["user_id"]
-            )
-
-
-# ---------- ADMIN COMMANDS ----------
-
-async def admin_stats(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-    if not is_admin(update.effective_user.id):
-        await update.effective_message.reply_text(
-            "⛔ Нет доступа."
+    with db() as c:
+        c.execute(
+            "DELETE FROM favorites "
+            "WHERE uid=? AND type=? AND item=?",
+            (
+                callback.from_user.id,
+                item_type,
+                item,
+            ),
         )
-        return
 
-    with get_db() as db:
-        users = db.execute(
-            "SELECT COUNT(*) FROM users"
-        ).fetchone()[0]
-
-        active_users = db.execute(
-            """
-            SELECT COUNT(*) FROM users
-            WHERE blocked = 0
-            """
-        ).fetchone()[0]
-
-        open_tickets = db.execute(
-            """
-            SELECT COUNT(*) FROM tickets
-            WHERE status = 'open'
-            """
-        ).fetchone()[0]
-
-        orders = db.execute(
-            "SELECT COUNT(*) FROM orders"
-        ).fetchone()[0]
-
-    await update.effective_message.reply_text(
-        "🛠 <b>ADMIN STATISTICS</b>\n\n"
-        f"👥 Пользователей: {users}\n"
-        f"🟢 Не заблокировано: {active_users}\n"
-        f"🎧 Открытых обращений: {open_tickets}\n"
-        f"🛒 Заказов: {orders}",
-        parse_mode="HTML"
-    )
+    await callback.answer("Удалено")
 
 
-async def list_users(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-    if not is_admin(update.effective_user.id):
-        await update.effective_message.reply_text("⛔ Нет доступа.")
-        return
-
-    with get_db() as db:
-        rows = db.execute(
-            """
-            SELECT user_id, username, first_name, blocked
-            FROM users
-            ORDER BY id DESC
-            LIMIT 30
-            """
+@dp.message(F.text == "❤️ Избранное")
+async def favorites(message: Message):
+    with db() as c:
+        rows = c.execute(
+            "SELECT type,item,title FROM favorites "
+            "WHERE uid=? ORDER BY ts DESC LIMIT 40",
+            (message.from_user.id,),
         ).fetchall()
 
     if not rows:
-        await update.effective_message.reply_text(
-            "Пользователей пока нет."
-        )
+        await message.answer("❤️ Избранное пустое.")
         return
 
-    lines = ["👥 <b>ПОСЛЕДНИЕ ПОЛЬЗОВАТЕЛИ</b>\n"]
+    builder = InlineKeyboardBuilder()
 
     for row in rows:
-        status = "🚫" if row["blocked"] else "🟢"
-        username = "@" + row["username"] if row["username"] else "без username"
-
-        lines.append(
-            f"{status} <code>{row['user_id']}</code> — "
-            f"{html.escape(username)} — "
-            f"{html.escape(row['first_name'] or '')}"
+        builder.button(
+            text="🗑️ " + row["title"][:40],
+            callback_data=(
+                f"fav:del:{row['type']}:{row['item']}"
+            ),
         )
 
-    await update.effective_message.reply_text(
-        "\n".join(lines),
-        parse_mode="HTML"
+    builder.adjust(1)
+
+    await message.answer(
+        "❤️ Нажми на элемент, чтобы удалить:",
+        reply_markup=builder.as_markup(),
     )
 
 
-async def block_cmd(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-    if not is_admin(update.effective_user.id):
-        await update.effective_message.reply_text("⛔ Нет доступа.")
-        return
+# ==================== ГЕНЕРАТОР ИМЁН ====================
 
-    if not context.args or not context.args[0].isdigit():
-        await update.effective_message.reply_text(
-            "Использование: /block USER_ID"
+@dp.message(F.text == "⭐ Генератор")
+async def generator(message: Message):
+    names = [
+        "@"
+        + "".join(
+            random.choice(string.ascii_lowercase + string.digits)
+            for _ in range(random.randint(5, 9))
         )
-        return
+        for _ in range(5)
+    ]
 
-    target_id = int(context.args[0])
+    builder = InlineKeyboardBuilder()
 
-    if target_id in ADMIN_IDS:
-        await update.effective_message.reply_text(
-            "❌ Нельзя блокировать администратора из этой команды."
-        )
-        return
-
-    with get_db() as db:
-        db.execute(
-            "UPDATE users SET blocked = 1 WHERE user_id = ?",
-            (target_id,)
+    for name in names:
+        builder.button(
+            text="❤️ " + name,
+            callback_data="fav:add:username:" + name[1:],
         )
 
-    await update.effective_message.reply_text(
-        f"🚫 Пользователь {target_id} заблокирован, если он есть в базе."
+    builder.adjust(1)
+
+    await message.answer(
+        "⭐ Случайные варианты.\n"
+        "Доступность имён не проверяется:\n\n"
+        + "\n".join(names),
+        reply_markup=builder.as_markup(),
     )
 
 
-async def unblock_cmd(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-    if not is_admin(update.effective_user.id):
-        await update.effective_message.reply_text("⛔ Нет доступа.")
-        return
+# ==================== ПРОФИЛЬ ====================
 
-    if not context.args or not context.args[0].isdigit():
-        await update.effective_message.reply_text(
-            "Использование: /unblock USER_ID"
-        )
-        return
+@dp.message(F.text == "👤 Профиль")
+async def profile(message: Message):
+    reg(message.from_user)
 
-    target_id = int(context.args[0])
+    with db() as c:
+        user = c.execute(
+            "SELECT * FROM users WHERE id=?",
+            (message.from_user.id,),
+        ).fetchone()
 
-    with get_db() as db:
-        db.execute(
-            "UPDATE users SET blocked = 0 WHERE user_id = ?",
-            (target_id,)
-        )
+        orders_count = c.execute(
+            "SELECT COUNT(*) FROM orders WHERE uid=?",
+            (message.from_user.id,),
+        ).fetchone()[0]
 
-    await update.effective_message.reply_text(
-        f"✅ Блокировка пользователя {target_id} снята."
+        favorites_count = c.execute(
+            "SELECT COUNT(*) FROM favorites WHERE uid=?",
+            (message.from_user.id,),
+        ).fetchone()[0]
+
+    await message.answer(
+        "👤 <b>Профиль</b>\n"
+        f"ID: <code>{user['id']}</code>\n"
+        f"Баллы: {user['points']}\n"
+        f"VIP: {html.escape(user['vip'])}\n"
+        f"Заказов: {orders_count}\n"
+        f"Избранное: {favorites_count}"
     )
 
 
-async def broadcast_cmd(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-    if not is_admin(update.effective_user.id):
-        await update.effective_message.reply_text("⛔ Нет доступа.")
-        return
+# ==================== ЕЖЕДНЕВНАЯ НАГРАДА ====================
 
-    text = " ".join(context.args).strip()
+@dp.message(F.text == "🎁 Ежедневная награда")
+async def daily(message: Message):
+    reg(message.from_user)
+    day = int(time.time()) // 86400
 
-    if not text:
-        await update.effective_message.reply_text(
-            "Использование: /broadcast текст сообщения"
-        )
-        return
+    with db() as c:
+        user = c.execute(
+            "SELECT daily FROM users WHERE id=?",
+            (message.from_user.id,),
+        ).fetchone()
 
-    with get_db() as db:
-        rows = db.execute(
-            "SELECT user_id FROM users WHERE blocked = 0"
-        ).fetchall()
-
-    sent = 0
-    failed = 0
-
-    for row in rows:
-        try:
-            await context.bot.send_message(
-                chat_id=row["user_id"],
-                text=text[:4000]
+        if user["daily"] == day:
+            await message.answer(
+                "Ты уже получил награду сегодня. "
+                "Возвращайся завтра!"
             )
-            sent += 1
-        except Exception:
-            failed += 1
+            return
 
-    await update.effective_message.reply_text(
-        f"📣 Рассылка завершена.\n"
-        f"Отправлено: {sent}\n"
-        f"Не отправлено: {failed}"
+        bonus = random.randint(5, 20)
+
+        c.execute(
+            "UPDATE users SET points=points+?,daily=? WHERE id=?",
+            (bonus, day, message.from_user.id),
+        )
+
+    await message.answer(
+        f"🎉 Начислено +{bonus} баллов!"
     )
 
 
-async def ticket_reply_cmd(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-    if not is_admin(update.effective_user.id):
-        await update.effective_message.reply_text("⛔ Нет доступа.")
-        return
+# ==================== VIP И ПОДАРКИ ====================
 
-    if len(context.args) < 2 or not context.args[0].isdigit():
-        await update.effective_message.reply_text(
-            "Использование: /ticket_reply ID текст ответа"
+@dp.message(F.text == "💎 VIP")
+async def vip(message: Message):
+    with db() as c:
+        user = c.execute(
+            "SELECT vip FROM users WHERE id=?",
+            (message.from_user.id,),
+        ).fetchone()
+
+    status = user["vip"] if user else "Обычный"
+
+    await message.answer(
+        "💎 Твой статус: " + status
+    )
+
+
+@dp.message(F.text == "🎁 Подарки")
+async def gifts(message: Message):
+    await message.answer(
+        "🎁 Реальные Telegram-подарки подключаются "
+        "через поддерживаемые официальные возможности Telegram.\n\n"
+        f"Поддержка: {SUPPORT}"
+    )
+
+
+@dp.message(F.text == "ℹ️ Информация")
+async def info(message: Message):
+    await message.answer(
+        "🤖 PROTIVZLA ULTIMATE\n"
+        f"Поддержка: {SUPPORT}"
+    )
+
+
+# ==================== ПОДДЕРЖКА ====================
+
+class Support(StatesGroup):
+    msg = State()
+
+
+@dp.message(F.text == "🎧 Поддержка")
+async def support_start(
+    message: Message,
+    state: FSMContext,
+):
+    reg(message.from_user)
+    await state.set_state(Support.msg)
+
+    await message.answer(
+        "Напиши обращение одним сообщением.\n"
+        "/cancel — отмена."
+    )
+
+
+@dp.message(Support.msg)
+async def support_send(
+    message: Message,
+    state: FSMContext,
+):
+    if not message.text:
+        await message.answer(
+            "Отправь обращение текстом."
         )
         return
 
-    ticket_id = int(context.args[0])
-    reply_text = " ".join(context.args[1:]).strip()
+    with db() as c:
+        ticket_id = c.execute(
+            "INSERT INTO tickets(uid,msg,ts) VALUES(?,?,?)",
+            (
+                message.from_user.id,
+                message.text[:3000],
+                ts(),
+            ),
+        ).lastrowid
 
-    with get_db() as db:
-        ticket = db.execute(
-            """
-            SELECT user_id FROM tickets
-            WHERE id = ?
-            """,
-            (ticket_id,)
+    await state.clear()
+
+    await message.answer(
+        f"✅ Обращение №{ticket_id} отправлено."
+    )
+
+    try:
+        await message.bot.send_message(
+            OWNER_ID,
+            f"🎧 Обращение #{ticket_id}\n"
+            f"От пользователя <code>{message.from_user.id}</code>\n"
+            f"{html.escape(message.text[:2500])}\n\n"
+            f"Ответ: /reply {ticket_id} текст",
+        )
+    except TelegramAPIError:
+        pass
+
+
+@dp.message(Command("reply"))
+async def reply(message: Message):
+    if not await om(message):
+        return
+
+    parts = (message.text or "").split(maxsplit=2)
+
+    if len(parts) < 3 or not parts[1].isdigit():
+        await message.answer(
+            "Формат: /reply НОМЕР текст"
+        )
+        return
+
+    with db() as c:
+        ticket = c.execute(
+            "SELECT uid FROM tickets WHERE id=?",
+            (int(parts[1]),),
         ).fetchone()
 
         if not ticket:
-            await update.effective_message.reply_text(
-                "❌ Обращение не найдено."
+            await message.answer(
+                "Обращение не найдено."
             )
             return
 
-        db.execute(
-            """
-            UPDATE tickets SET status = 'answered'
-            WHERE id = ?
-            """,
-            (ticket_id,)
+        c.execute(
+            "UPDATE tickets SET status='Отвечено' WHERE id=?",
+            (int(parts[1]),),
         )
 
     try:
-        await context.bot.send_message(
-            chat_id=ticket["user_id"],
-            text=f"🎧 Ответ поддержки на обращение #{ticket_id}:\n\n{reply_text[:3500]}"
+        await message.bot.send_message(
+            ticket["uid"],
+            f"🎧 Ответ поддержки #{parts[1]}:\n\n{parts[2]}",
         )
-
-        await update.effective_message.reply_text(
-            "✅ Ответ отправлен пользователю."
-        )
-
-    except Exception:
-        await update.effective_message.reply_text(
-            "⚠️ Не удалось отправить ответ."
+        await message.answer("Ответ отправлен.")
+    except TelegramAPIError:
+        await message.answer(
+            "Не удалось отправить ответ."
         )
 
 
-# ---------- PRODUCT MANAGEMENT ----------
+# ==================== ПРОМОКОДЫ ====================
 
-async def product_add_cmd(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-    if not is_admin(update.effective_user.id):
-        await update.effective_message.reply_text("⛔ Нет доступа.")
+@dp.message(Command("promo"))
+async def make_promo(message: Message):
+    if not await om(message):
         return
 
-    raw = " ".join(context.args)
+    parts = (message.text or "").split()
 
-    parts = [part.strip() for part in raw.split("|", 2)]
-
-    if len(parts) != 3:
-        await update.effective_message.reply_text(
-            "Использование:\n"
-            "/product_add Название | описание | цена_в_звёздах"
+    if len(parts) != 4:
+        await message.answer(
+            "Формат: /promo КОД БОНУС ЛИМИТ"
         )
         return
-
-    name, description, price_text = parts
 
     try:
-        price = int(price_text)
+        bonus = int(parts[2])
+        limit = int(parts[3])
+
+        if bonus < 0 or limit <= 0:
+            raise ValueError
     except ValueError:
-        await update.effective_message.reply_text(
-            "Цена должна быть целым числом."
+        await message.answer(
+            "Бонус должен быть ≥ 0, лимит ≥ 1."
         )
         return
 
-    if not name or price < 1:
-        await update.effective_message.reply_text(
-            "Название обязательно, цена должна быть больше нуля."
-        )
-        return
-
-    with get_db() as db:
-        db.execute(
-            """
-            INSERT INTO products (name, description, price, active)
-            VALUES (?, ?, ?, 1)
-            """,
-            (name[:100], description[:1000], price)
+    with db() as c:
+        c.execute(
+            "INSERT OR REPLACE INTO promos"
+            "(code,bonus,maxuses,uses,active) "
+            "VALUES(?,?,?,0,1)",
+            (parts[1].upper(), bonus, limit),
         )
 
-    await update.effective_message.reply_text(
-        "✅ Товар добавлен в магазин."
+    audit("create_promo", parts[1].upper())
+
+    await message.answer("Промокод создан.")
+
+
+@dp.message(F.text == "🎟️ Промокод")
+async def promo_prompt(
+    message: Message,
+    state: FSMContext,
+):
+    reg(message.from_user)
+    await state.set_state(Promo.code)
+
+    await message.answer(
+        "Отправь код промокода. /cancel — отмена."
     )
 
 
-async def promo_create_cmd(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
+@dp.message(Promo.code)
+async def redeem(
+    message: Message,
+    state: FSMContext,
 ):
-    if not is_admin(update.effective_user.id):
-        await update.effective_message.reply_text("⛔ Нет доступа.")
-        return
+    reg(message.from_user)
+    code = (message.text or "").strip().upper()
 
-    if len(context.args) < 3:
-        await update.effective_message.reply_text(
-            "Использование:\n"
-            "/promo_create CODE BONUS MAX_USES\n\n"
-            "Пример: /promo_create WELCOME Бонус 100"
-        )
-        return
-
-    code = context.args[0].upper()
-
-    if not re.fullmatch(r"[A-Z0-9_-]{3,32}", code):
-        await update.effective_message.reply_text(
-            "Код должен содержать 3–32 символа: A-Z, цифры, _ или -."
-        )
-        return
-
-    bonus = context.args[1]
-
-    try:
-        max_uses = int(context.args[2])
-    except ValueError:
-        await update.effective_message.reply_text(
-            "MAX_USES должен быть числом. 0 означает без общего лимита."
-        )
-        return
-
-    if max_uses < 0:
-        await update.effective_message.reply_text(
-            "Лимит не может быть отрицательным."
-        )
-        return
-
-    try:
-        with get_db() as db:
-            db.execute(
-                """
-                INSERT INTO promos
-                    (code, bonus, max_uses, used_count, active, expires_at)
-                VALUES (?, ?, ?, 0, 1, NULL)
-                """,
-                (code, bonus[:100], max_uses)
-            )
-
-        await update.effective_message.reply_text(
-            f"✅ Промокод {code} создан."
-        )
-
-    except sqlite3.IntegrityError:
-        await update.effective_message.reply_text(
-            "❌ Такой промокод уже существует."
-        )
-
-
-# ---------- ADMIN PANEL ----------
-
-async def admin_panel(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-    if not is_admin(update.effective_user.id):
-        await update.effective_message.reply_text(
-            "⛔ Эта панель доступна только администраторам."
-        )
-        return
-
-    keyboard = [
-        [
-            InlineKeyboardButton(
-                "📊 Статистика",
-                callback_data="admin:stats"
-            ),
-            InlineKeyboardButton(
-                "👥 Пользователи",
-                callback_data="admin:users"
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "🛍 Магазин",
-                callback_data="admin:shop"
-            ),
-            InlineKeyboardButton(
-                "🎟 Промокоды",
-                callback_data="admin:promos"
-            )
-        ]
-    ]
-
-    await update.effective_message.reply_text(
-        "🛠 <b>PROTIVZLA ADMIN PANEL</b>\n\n"
-        "Команды:\n"
-        "/admin_stats — статистика\n"
-        "/users — пользователи\n"
-        "/block ID — блокировка\n"
-        "/unblock ID — разблокировка\n"
-        "/broadcast текст — рассылка\n"
-        "/product_add Название | описание | цена\n"
-        "/promo_create CODE BONUS MAX\n"
-        "/ticket_reply ID текст — ответить на обращение",
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
-    # =========================
-# PART 3/3 — HANDLERS & RUN
-# =========================
-
-import asyncio
-
-
-# ---------- PRODUCT DETAILS ----------
-
-async def show_product(
-    query,
-    product_id: int
-):
-    with get_db() as db:
-        product = db.execute(
-            """
-            SELECT id, name, description, price
-            FROM products
-            WHERE id = ? AND active = 1
-            """,
-            (product_id,)
+    with db() as c:
+        promo = c.execute(
+            "SELECT * FROM promos WHERE code=? AND active=1",
+            (code,),
         ).fetchone()
 
-    if not product:
-        await query.message.reply_text("❌ Товар не найден.")
-        return
-
-    keyboard = [
-        [
-            InlineKeyboardButton(
-                f"⭐ Купить за {product['price']} Stars",
-                callback_data=f"buy:{product['id']}"
+        if not promo:
+            await message.answer(
+                "Промокод не найден."
             )
-        ],
-        [
-            InlineKeyboardButton(
-                "⭐ В избранное",
-                callback_data=f"fav_product:{product['id']}"
-            )
-        ]
-    ]
+            return
 
-    await query.message.reply_text(
-        "🛍 <b>ТОВАР</b>\n\n"
-        f"Название: {html.escape(product['name'])}\n"
-        f"Описание: {html.escape(product['description'] or '')}\n"
-        f"Цена: {product['price']} ⭐\n\n"
-        "Покупка доступна через Telegram Stars.",
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup(keyboard)
+        if promo["uses"] >= promo["maxuses"]:
+            await message.answer(
+                "Лимит активаций исчерпан."
+            )
+            return
+
+        used = c.execute(
+            "SELECT 1 FROM promo_uses WHERE code=? AND uid=?",
+            (code, message.from_user.id),
+        ).fetchone()
+
+        if used:
+            await message.answer(
+                "Ты уже активировал этот код."
+            )
+            return
+
+        c.execute(
+            "INSERT INTO promo_uses VALUES(?,?)",
+            (code, message.from_user.id),
+        )
+
+        c.execute(
+            "UPDATE promos SET uses=uses+1 WHERE code=?",
+            (code,),
+        )
+
+        c.execute(
+            "UPDATE users SET points=points+? WHERE id=?",
+            (promo["bonus"], message.from_user.id),
+        )
+
+    await state.clear()
+
+    await message.answer(
+        f"🎉 Начислено +{promo['bonus']} баллов!"
     )
 
 
-# ---------- TELEGRAM STARS PAYMENT ----------
+# ==================== АДМИН-ПАНЕЛЬ ====================
 
-async def buy_product(
-    query,
-    context: ContextTypes.DEFAULT_TYPE,
-    product_id: int
+@dp.callback_query(F.data.startswith("adm:"))
+async def admin_callback(
+    callback: CallbackQuery,
+    bot: Bot,
+    state: FSMContext,
 ):
-    user_id = query.from_user.id
-
-    with get_db() as db:
-        product = db.execute(
-            """
-            SELECT id, name, description, price
-            FROM products
-            WHERE id = ? AND active = 1
-            """,
-            (product_id,)
-        ).fetchone()
-
-    if not product:
-        await query.message.reply_text(
-            "❌ Этот товар больше недоступен."
-        )
+    if not await oc(callback):
         return
 
-    price = int(product["price"])
+    key = callback.data.split(":", 1)[1]
 
-    if price < 1:
-        await query.message.reply_text(
-            "❌ Некорректная цена товара."
+    if key == "home":
+        await callback.message.edit_text(
+            "👑 МЕГА-ПАНЕЛЬ PROTIVZLA",
+            reply_markup=adm_menu(),
         )
+
+    elif key == "stats":
+        with db() as c:
+            users = c.execute(
+                "SELECT COUNT(*) FROM users"
+            ).fetchone()[0]
+
+            orders_count = c.execute(
+                "SELECT COUNT(*) FROM orders"
+            ).fetchone()[0]
+
+            tickets = c.execute(
+                "SELECT COUNT(*) FROM tickets WHERE status='Открыто'"
+            ).fetchone()[0]
+
+            broadcasts = c.execute(
+                "SELECT COUNT(*) FROM broadcasts"
+            ).fetchone()[0]
+
+        await callback.message.edit_text(
+            "📊 <b>Статистика</b>\n"
+            f"Пользователей: {users}\n"
+            f"Заказов: {orders_count}\n"
+            f"Открытых обращений: {tickets}\n"
+            f"Рассылок: {broadcasts}",
+            reply_markup=back(),
+        )
+
+    elif key == "users":
+        with db() as c:
+            rows = c.execute(
+                "SELECT id,name,points,vip FROM users "
+                "ORDER BY seen DESC LIMIT 15"
+            ).fetchall()
+
+        text = "👥 <b>Пользователи</b>\n"
+
+        text += "\n".join(
+            f"{r['id']} | {html.escape(r['name'] or '')} | "
+            f"{r['points']} баллов | {html.escape(r['vip'])}"
+            for r in rows
+        ) or "Пока нет пользователей"
+
+        text += "\n\nПоиск: /user ID"
+
+        await callback.message.edit_text(
+            text,
+            reply_markup=back(),
+        )
+
+    elif key == "shop":
+        with db() as c:
+            rows = c.execute(
+                "SELECT id,title,price FROM products "
+                "ORDER BY id DESC LIMIT 15"
+            ).fetchall()
+
+        text = "🛍️ <b>Товары</b>\n"
+
+        text += "\n".join(
+            f"#{r['id']} {html.escape(r['title'])} — {r['price']}"
+            for r in rows
+        ) or "Нет товаров"
+
+        text += (
+            "\n\nДобавить товар:\n"
+            "/addproduct Название | Описание | Цена"
+        )
+
+        await callback.message.edit_text(
+            text,
+            reply_markup=back(),
+        )
+
+    elif key == "promos":
+        await callback.message.edit_text(
+            "Создать промокод:\n"
+            "/promo КОД БОНУС ЛИМИТ",
+            reply_markup=back(),
+        )
+
+    elif key == "vip":
+        await callback.message.edit_text(
+            "Изменить VIP:\n"
+            "/setvip TELEGRAM_ID Название",
+            reply_markup=back(),
+        )
+
+    elif key == "tickets":
+        with db() as c:
+            rows = c.execute(
+                "SELECT id,uid,msg,status FROM tickets "
+                "ORDER BY id DESC LIMIT 10"
+            ).fetchall()
+
+        text = "🎧 <b>Обращения</b>\n"
+
+        text += "\n\n".join(
+            f"#{r['id']} | user {r['uid']} | {r['status']}\n"
+            f"{html.escape(r['msg'][:200])}"
+            for r in rows
+        ) or "Нет обращений"
+
+        text += "\n\nОтвет: /reply НОМЕР текст"
+
+        await callback.message.edit_text(
+            text,
+            reply_markup=back(),
+        )
+
+    elif key == "broadcast":
+        await callback.message.edit_text(
+            "📢 <b>Центр рассылок</b>",
+            reply_markup=ik([
+                [
+                    InlineKeyboardButton(
+                        text="✉️ Текст",
+                        callback_data="bc:new:text",
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        text="🖼️ Фото + подпись",
+                        callback_data="bc:new:photo",
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        text="🕒 Запланированные",
+                        callback_data="bc:scheduled",
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        text="📝 История",
+                        callback_data="bc:history",
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        text="⏸️ Остановить активную",
+                        callback_data="bc:stop",
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        text="⬅️ Назад",
+                        callback_data="adm:home",
+                    )
+                ],
+            ]),
+        )
+
+    elif key == "backup":
+        from aiogram.types import BufferedInputFile
+
+        with db() as source:
+            destination = sqlite3.connect(":memory:")
+            source.backup(destination)
+            data = destination.serialize()
+            destination.close()
+
+        await bot.send_document(
+            OWNER_ID,
+            BufferedInputFile(
+                data,
+                filename=(
+                    "protivzla-backup-"
+                    + datetime.now().strftime("%Y%m%d-%H%M%S")
+                    + ".db"
+                ),
+            ),
+            caption="Резервная копия базы",
+        )
+
+        await callback.answer(
+            "Копия отправлена владельцу."
+        )
+
+    elif key == "audit":
+        with db() as c:
+            rows = c.execute(
+                "SELECT action,details,ts FROM audit "
+                "ORDER BY id DESC LIMIT 15"
+            ).fetchall()
+
+        text = "📜 <b>Журнал действий</b>\n"
+
+        text += "\n".join(
+            datetime.fromtimestamp(r["ts"]).strftime("%d.%m %H:%M")
+            + " "
+            + html.escape(r["action"])
+            + ": "
+            + html.escape(r["details"])
+            for r in rows
+        ) or "Журнал пуст"
+
+        await callback.message.edit_text(
+            text,
+            reply_markup=back(),
+        )
+
+    elif key == "settings":
+        await callback.message.edit_text(
+            f"⚙️ Поддержка: {html.escape(SUPPORT)}\n"
+            f"База: <code>{html.escape(DB_PATH)}</code>\n"
+            f"Владелец ID: <code>{OWNER_ID}</code>",
+            reply_markup=back(),
+        )
+
+    await callback.answer()
+
+
+# ==================== ЦЕНТР РАССЫЛОК ====================
+
+@dp.callback_query(F.data.startswith("bc:"))
+async def broadcast_callback(
+    callback: CallbackQuery,
+    state: FSMContext,
+    bot: Bot,
+):
+    if not await oc(callback):
         return
 
-    payload = f"product:{product_id}:user:{user_id}"
+    parts = callback.data.split(":")
+    action = parts[1]
 
-    try:
-        await context.bot.send_invoice(
-            chat_id=user_id,
-            title=product["name"][:32],
-            description=(product["description"] or product["name"])[:255],
-            payload=payload,
-            provider_token="",
-            currency="XTR",
-            prices=[
-                LabeledPrice(
-                    label=product["name"][:32],
-                    amount=price
+    if action == "new":
+        await state.clear()
+
+        await state.update_data(
+            kind=parts[2],
+            body="",
+            photo="",
+            btn="",
+            url="",
+            scheduled=0,
+        )
+
+        if parts[2] == "text":
+            await state.set_state(BC.body)
+            await callback.message.edit_text(
+                "✉️ Отправь текст рассылки.\n"
+                "/cancel — отмена."
+            )
+        else:
+            await state.set_state(BC.photo)
+            await callback.message.edit_text(
+                "🖼️ Отправь фотографию.\n"
+                "/cancel — отмена."
+            )
+
+    elif action == "history":
+        with db() as c:
+            rows = c.execute(
+                "SELECT id,status,created,sent,failed,scheduled "
+                "FROM broadcasts ORDER BY id DESC LIMIT 15"
+            ).fetchall()
+
+        text = "📝 <b>История рассылок</b>\n"
+
+        text += "\n".join(
+            f"#{r['id']} {r['status']} | "
+            f"успешно {r['sent']} | ошибки {r['failed']} | "
+            + datetime.fromtimestamp(r["created"]).strftime("%d.%m %H:%M")
+            for r in rows
+        ) or "История пуста"
+
+        await callback.message.edit_text(
+            text,
+            reply_markup=back(),
+        )
+
+    elif action == "scheduled":
+        with db() as c:
+            rows = c.execute(
+                "SELECT id,body,scheduled FROM broadcasts "
+                "WHERE status='Запланирована' "
+                "ORDER BY scheduled LIMIT 20"
+            ).fetchall()
+
+        text = "🕒 <b>Запланированные рассылки</b>\n"
+
+        text += "\n".join(
+            f"#{r['id']} "
+            f"{datetime.fromtimestamp(r['scheduled']).strftime('%d.%m %H:%M')} "
+            f"{html.escape(r['body'][:80])}"
+            for r in rows
+        ) or "Нет запланированных рассылок"
+
+        await callback.message.edit_text(
+            text,
+            reply_markup=ik([
+                [
+                    InlineKeyboardButton(
+                        text="Отменить по ID",
+                        callback_data="bc:cancel_prompt",
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        text="⬅️ Назад",
+                        callback_data="adm:broadcast",
+                    )
+                ],
+            ]),
+        )
+
+    elif action == "cancel_prompt":
+        await state.set_state(BC.cancel_id)
+
+        await callback.message.edit_text(
+            "Отправь ID запланированной рассылки.\n"
+            "/cancel — отмена."
+        )
+
+    elif action == "stop":
+        ids = list(active)
+
+        if not ids:
+            await callback.answer(
+                "Активных рассылок нет.",
+                show_alert=True,
+            )
+        else:
+            stop.update(ids)
+
+            with db() as c:
+                c.executemany(
+                    "UPDATE broadcasts SET status='Остановлена' "
+                    "WHERE id=?",
+                    [(broadcast_id,) for broadcast_id in ids],
                 )
-            ]
+
+            await callback.message.edit_text(
+                "⏸️ Остановка рассылки запрошена.",
+                reply_markup=back(),
+            )
+
+    elif action == "discard":
+        await state.clear()
+
+        await callback.message.edit_text(
+            "Черновик удалён."
         )
 
-        log_action(
-            user_id,
-            "invoice_created",
-            f"product_id={product_id}"
+    elif action in ("send", "schedule"):
+        data = await state.get_data()
+
+        if not data.get("ready"):
+            await callback.answer(
+                "Сначала подготовь предпросмотр.",
+                show_alert=True,
+            )
+            return
+
+        if action == "schedule":
+            await state.set_state(BC.schedule)
+
+            await callback.message.edit_text(
+                "Отправь дату и время по часовому поясу сервера:\n"
+                "ГГГГ-ММ-ДД ЧЧ:ММ"
+            )
+        else:
+            broadcast_id = save_bc(
+                data,
+                0,
+                "В очереди",
+            )
+
+            await state.clear()
+
+            await callback.message.edit_text(
+                f"✅ Рассылка #{broadcast_id} поставлена в очередь."
+            )
+
+            asyncio.create_task(
+                run_bc(bot, broadcast_id)
+            )
+
+    elif action == "confirm_schedule":
+        data = await state.get_data()
+
+        broadcast_id = save_bc(
+            data,
+            data.get("scheduled", 0),
+            "Запланирована",
         )
 
-    except Exception:
-        logging.exception("Could not create Stars invoice")
+        await state.clear()
 
-        await query.message.reply_text(
-            "⚠️ Не удалось создать счёт. Попробуй позже."
+        await callback.message.edit_text(
+            f"🕒 Рассылка #{broadcast_id} запланирована."
         )
 
+    await callback.answer()
 
-async def precheckout_handler(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-    query = update.pre_checkout_query
+
+def save_bc(data, scheduled, status):
+    with db() as c:
+        return c.execute(
+            "INSERT INTO broadcasts"
+            "(kind,body,photo,btn,url,status,scheduled,created) "
+            "VALUES(?,?,?,?,?,?,?,?)",
+            (
+                data["kind"],
+                data.get("body", ""),
+                data.get("photo", ""),
+                data.get("btn", ""),
+                data.get("url", ""),
+                status,
+                scheduled,
+                ts(),
+            ),
+        ).lastrowid
+
+
+async def ask_btn(message, state):
+    await state.set_state(BC.btn)
+
+    await message.answer(
+        "🔘 Отправь текст URL-кнопки.\n"
+        "Отправь символ —, чтобы пропустить."
+    )
+
+
+@dp.message(BC.body)
+async def bc_body(message: Message, state: FSMContext):
+    if not await om(message):
+        return
+
+    if not message.text:
+        await message.answer("Отправь текст сообщением.")
+        return
+
+    await state.update_data(
+        body=message.text[:3900]
+    )
+
+    await ask_btn(message, state)
+
+
+@dp.message(BC.photo, F.photo)
+async def bc_photo(message: Message, state: FSMContext):
+    if not await om(message):
+        return
+
+    await state.update_data(
+        photo=message.photo[-1].file_id
+    )
+
+    await state.set_state(BC.caption)
+
+    await message.answer(
+        "Отправь подпись к фото или — без подписи."
+    )
+
+
+@dp.message(BC.photo)
+async def bc_photo_bad(message: Message):
+    await message.answer("Нужно отправить фотографию.")
+
+
+@dp.message(BC.caption)
+async def bc_caption(message: Message, state: FSMContext):
+    if not await om(message):
+        return
+
+    caption = (message.text or "").strip()
+
+    await state.update_data(
+        body="" if caption == "—" else caption[:1000]
+    )
+
+    await ask_btn(message, state)
+
+
+@dp.message(BC.btn)
+async def bc_btn(message: Message, state: FSMContext):
+    if not await om(message):
+        return
+
+    text = (message.text or "").strip()
+
+    if text == "—" or not text:
+        await state.update_data(btn="", url="")
+        await preview(message, state)
+        return
+
+    await state.update_data(
+        btn=text[:64]
+    )
+
+    await state.set_state(BC.url)
+
+    await message.answer(
+        "Отправь URL кнопки (https://... или http://...)."
+    )
+
+
+@dp.message(BC.url)
+async def bc_url(message: Message, state: FSMContext):
+    if not await om(message):
+        return
+
+    url = (message.text or "").strip()
+
+    if not url.startswith(("https://", "http://")):
+        await message.answer(
+            "Ссылка должна начинаться с https:// или http://."
+        )
+        return
+
+    await state.update_data(url=url)
+
+    await preview(message, state)
+
+
+async def preview(message: Message, state: FSMContext):
+    data = await state.get_data()
+
+    rows = []
+
+    if data.get("btn") and data.get("url"):
+        rows = [[
+            InlineKeyboardButton(
+                text=data["btn"],
+                url=data["url"],
+            )
+        ]]
+
+    keyboard = ik(rows) if rows else None
+
+    if data.get("photo"):
+        await message.answer_photo(
+            data["photo"],
+            caption=data.get("body") or None,
+            reply_markup=keyboard,
+        )
+    else:
+        await message.answer(
+            data.get("body", ""),
+            reply_markup=keyboard,
+        )
+
+    await state.update_data(ready=True)
+
+    await message.answer(
+        "👀 Предпросмотр готов. Запускать?",
+        reply_markup=ik([
+            [
+                InlineKeyboardButton(
+                    text="🚀 Отправить сейчас",
+                    callback_data="bc:send",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🕒 Запланировать",
+                    callback_data="bc:schedule",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="❌ Удалить",
+                    callback_data="bc:discard",
+                )
+            ],
+        ]),
+    )
+
+
+@dp.message(BC.schedule)
+async def bc_schedule(message: Message, state: FSMContext):
+    if not await om(message):
+        return
 
     try:
-        parts = query.invoice_payload.split(":")
+        dt = datetime.strptime(
+            (message.text or "").strip(),
+            "%Y-%m-%d %H:%M",
+        )
 
-        if (
-            len(parts) != 4
-            or parts[0] != "product"
-            or parts[2] != "user"
-        ):
-            await query.answer(
-                ok=False,
-                error_message="Некорректный счёт."
-            )
-            return
+        scheduled = int(dt.timestamp())
 
-        product_id = int(parts[1])
-        invoice_user_id = int(parts[3])
+        if scheduled <= ts():
+            raise ValueError
 
-        if query.from_user.id != invoice_user_id:
-            await query.answer(
-                ok=False,
-                error_message="Этот счёт создан для другого пользователя."
-            )
-            return
+    except ValueError:
+        await message.answer(
+            "Неверный формат или время в прошлом.\n"
+            "Пример: 2026-12-31 18:30"
+        )
+        return
 
-        with get_db() as db:
-            product = db.execute(
-                """
-                SELECT id, price
-                FROM products
-                WHERE id = ? AND active = 1
-                """,
-                (product_id,)
+    await state.update_data(
+        scheduled=scheduled
+    )
+
+    await message.answer(
+        f"Запланировать на {dt.strftime('%d.%m.%Y %H:%M')} "
+        "по часовому поясу сервера?",
+        reply_markup=ik([
+            [
+                InlineKeyboardButton(
+                    text="✅ Подтвердить",
+                    callback_data="bc:confirm_schedule",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="❌ Отмена",
+                    callback_data="bc:discard",
+                )
+            ],
+        ]),
+    )
+
+
+@dp.message(BC.cancel_id)
+async def cancel_schedule(message: Message, state: FSMContext):
+    if not await om(message):
+        return
+
+    if not (message.text or "").isdigit():
+        await message.answer("Отправь числовой ID.")
+        return
+
+    with db() as c:
+        result = c.execute(
+            "UPDATE broadcasts SET status='Отменена' "
+            "WHERE id=? AND status='Запланирована'",
+            (int(message.text),),
+        )
+
+    await state.clear()
+
+    await message.answer(
+        "Запланированная рассылка отменена."
+        if result.rowcount
+        else "Рассылка не найдена."
+    )
+
+
+# ==================== ВЫПОЛНЕНИЕ РАССЫЛКИ ====================
+
+async def run_bc(bot: Bot, broadcast_id: int):
+    if broadcast_id in active:
+        return
+
+    active.add(broadcast_id)
+
+    try:
+        with db() as c:
+            broadcast = c.execute(
+                "SELECT * FROM broadcasts WHERE id=?",
+                (broadcast_id,),
             ).fetchone()
 
-        if not product or int(product["price"]) != query.total_amount:
-            await query.answer(
-                ok=False,
-                error_message="Товар недоступен или цена изменилась."
+            if not broadcast:
+                return
+
+            if broadcast["status"] not in (
+                "В очереди",
+                "Запланирована",
+            ):
+                return
+
+            result = c.execute(
+                "UPDATE broadcasts SET status='Выполняется' "
+                "WHERE id=? AND status IN ('В очереди','Запланирована')",
+                (broadcast_id,),
             )
-            return
 
-        await query.answer(ok=True)
+            if not result.rowcount:
+                return
 
-    except Exception:
-        logging.exception("Pre-checkout error")
+            users = c.execute(
+                "SELECT id FROM users "
+                "WHERE blocked=0 ORDER BY id"
+            ).fetchall()
+
+        sent = 0
+        failed = 0
+
+        for user in users:
+            if broadcast_id in stop:
+                break
+
+            keyboard = None
+
+            if broadcast["btn"] and broadcast["url"]:
+                keyboard = ik([[
+                    InlineKeyboardButton(
+                        text=broadcast["btn"],
+                        url=broadcast["url"],
+                    )
+                ]])
+
+            try:
+                if broadcast["photo"]:
+                    await bot.send_photo(
+                        user["id"],
+                        broadcast["photo"],
+                        caption=broadcast["body"] or None,
+                        reply_markup=keyboard,
+                    )
+                else:
+                    await bot.send_message(
+                        user["id"],
+                        broadcast["body"],
+                        reply_markup=keyboard,
+                    )
+
+                sent += 1
+
+            except TelegramForbiddenError:
+                failed += 1
+
+                with db() as c:
+                    c.execute(
+                        "UPDATE users SET blocked=1 WHERE id=?",
+                        (user["id"],),
+                    )
+
+            except TelegramAPIError as error:
+                failed += 1
+
+                logging.warning(
+                    "Рассылка %s, пользователь %s: %s",
+                    broadcast_id,
+                    user["id"],
+                    error,
+                )
+
+            with db() as c:
+                c.execute(
+                    "UPDATE broadcasts SET sent=?,failed=? WHERE id=?",
+                    (sent, failed, broadcast_id),
+                )
+
+            await asyncio.sleep(DELAY)
+
+        status = (
+            "Остановлена"
+            if broadcast_id in stop
+            else "Завершена"
+        )
+
+        with db() as c:
+            c.execute(
+                "UPDATE broadcasts SET status=?,sent=?,failed=? "
+                "WHERE id=?",
+                (status, sent, failed, broadcast_id),
+            )
+
+        audit(
+            "broadcast_finished",
+            f"id={broadcast_id}; status={status}; "
+            f"sent={sent}; failed={failed}",
+        )
 
         try:
-            await query.answer(
-                ok=False,
-                error_message="Не удалось проверить заказ."
+            await bot.send_message(
+                OWNER_ID,
+                f"📢 Рассылка #{broadcast_id}: {status}\n"
+                f"Успешно отправлено: {sent}\n"
+                f"Ошибки: {failed}",
             )
-        except Exception:
+        except TelegramAPIError:
             pass
 
-
-async def successful_payment_handler(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-    message = update.effective_message
-    payment = message.successful_payment
-    user_id = update.effective_user.id
-
-    try:
-        parts = payment.invoice_payload.split(":")
-
-        if (
-            len(parts) != 4
-            or parts[0] != "product"
-            or parts[2] != "user"
-            or int(parts[3]) != user_id
-        ):
-            await message.reply_text(
-                "⚠️ Оплата получена, но заказ требует проверки администратора."
-            )
-            return
-
-        product_id = int(parts[1])
-        charge_id = payment.telegram_payment_charge_id
-
-        with get_db() as db:
-            product = db.execute(
-                """
-                SELECT id, name, price
-                FROM products
-                WHERE id = ?
-                """,
-                (product_id,)
-            ).fetchone()
-
-            if not product:
-                await message.reply_text(
-                    "Оплата получена. Товар не найден — обратись в поддержку."
-                )
-                return
-
-            if int(product["price"]) != payment.total_amount:
-                await message.reply_text(
-                    "Оплата получена. Заказ требует проверки поддержки."
-                )
-                return
-
-            cursor = db.execute(
-                """
-                INSERT OR IGNORE INTO orders
-                    (
-                        user_id,
-                        product_id,
-                        amount,
-                        currency,
-                        status,
-                        telegram_payment_charge_id,
-                        created_at
-                    )
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    user_id,
-                    product_id,
-                    payment.total_amount,
-                    payment.currency,
-                    "paid",
-                    charge_id,
-                    now()
-                )
-            )
-
-            if cursor.rowcount == 0:
-                await message.reply_text(
-                    "ℹ️ Эта оплата уже зарегистрирована."
-                )
-                return
-
-        log_action(
-            user_id,
-            "purchase",
-            f"product_id={product_id}; charge={charge_id}"
-        )
-
-        await message.reply_text(
-            "✅ <b>ОПЛАТА ПОДТВЕРЖДЕНА</b>\n\n"
-            f"🛍 Товар: {html.escape(product['name'])}\n"
-            f"⭐ Сумма: {payment.total_amount}\n"
-            f"🧾 Заказ сохранён в базе.\n\n"
-            "Если товар требует ручной выдачи, дождись ответа поддержки.",
-            parse_mode="HTML"
-        )
-
     except Exception:
-        logging.exception("Successful payment handler failed")
-
-        await message.reply_text(
-            "Оплата получена, но при сохранении заказа возникла ошибка. "
-            "Обратись в поддержку и сохрани квитанцию Telegram."
+        logging.exception(
+            "Ошибка рассылки %s",
+            broadcast_id,
         )
 
-
-# ---------- SUBSCRIPTION BUTTONS ----------
-
-async def subscription_callback(
-    query,
-    context: ContextTypes.DEFAULT_TYPE
-):
-    await query.answer()
-
-    if query.data == "subscribe":
-        await query.message.reply_text(
-            f"📢 Подпишись на канал: {REQUIRED_CHAT_URL}\n\n"
-            "После подписки нажми «Проверить подписку»."
-        )
-        return
-
-    if query.data == "check_subscription":
-        user_id = query.from_user.id
-
-        try:
-            member = await context.bot.get_chat_member(
-                REQUIRED_CHAT,
-                user_id
+        with db() as c:
+            c.execute(
+                "UPDATE broadcasts SET status='Ошибка' WHERE id=?",
+                (broadcast_id,),
             )
 
-            status = str(member.status).lower()
+    finally:
+        active.discard(broadcast_id)
+        stop.discard(broadcast_id)
 
-            if status in (
-                "creator",
-                "owner",
-                "administrator",
-                "member"
-            ):
-                await query.message.reply_text(
-                    "✅ Подписка подтверждена!\n"
-                    "Отправь /start, чтобы открыть меню."
-                )
-            else:
-                await query.message.reply_text(
-                    "❌ Подписка пока не обнаружена."
+
+async def scheduler(bot: Bot):
+    while True:
+        try:
+            with db() as c:
+                rows = c.execute(
+                    "SELECT id FROM broadcasts "
+                    "WHERE status='Запланирована' AND scheduled<=?",
+                    (ts(),),
+                ).fetchall()
+
+            for row in rows:
+                asyncio.create_task(
+                    run_bc(bot, row["id"])
                 )
 
         except Exception:
-            logging.exception("Subscription check failed")
+            logging.exception("Ошибка планировщика")
 
-            await query.message.reply_text(
-                "⚠️ Не удалось проверить подписку. "
-                "Проверь, что бот может получать информацию о канале."
-            )
+        await asyncio.sleep(10)
 
 
-# ---------- CALLBACK ROUTER ----------
+# ==================== КОМАНДЫ ВЛАДЕЛЬЦА ====================
 
-async def callback_router(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-    query = update.callback_query
-
-    if not query:
+@dp.message(Command("addproduct"))
+async def add_product(message: Message):
+    if not await om(message):
         return
 
-    data = query.data or ""
+    parts = [
+        item.strip()
+        for item in (message.text or "").partition(" ")[2].split("|")
+    ]
 
-    if data in ("subscribe", "check_subscription"):
-        await subscription_callback(query, context)
-        return
-
-    await query.answer()
-
-    user_id = query.from_user.id
-
-    if is_blocked(user_id):
-        await query.message.reply_text(
-            "🚫 Доступ к боту ограничен."
+    if len(parts) != 3:
+        await message.answer(
+            "Формат:\n"
+            "/addproduct Название | Описание | Цена"
         )
         return
 
-    if data.startswith("fav_username:"):
-        username = data.split(":", 1)[1]
+    try:
+        price = int(parts[2])
 
-        added = await add_favorite(
-            user_id,
-            "username",
-            username
-        )
+        if price < 0:
+            raise ValueError
 
-        await query.message.reply_text(
-            "⭐ Сохранено в избранное."
-            if added
-            else "ℹ️ Этот вариант уже есть в избранном."
-        )
-
-        log_action(
-            user_id,
-            "favorite_username",
-            username
+    except ValueError:
+        await message.answer(
+            "Цена должна быть числом не меньше нуля."
         )
         return
 
-    if data.startswith("remove_fav:"):
-        try:
-            favorite_id = int(data.split(":", 1)[1])
-        except ValueError:
-            return
+    with db() as c:
+        product_id = c.execute(
+            "INSERT INTO products(title,description,price) "
+            "VALUES(?,?,?)",
+            (
+                parts[0][:100],
+                parts[1][:1000],
+                price,
+            ),
+        ).lastrowid
 
-        with get_db() as db:
-            db.execute(
-                """
-                DELETE FROM favorites
-                WHERE id = ? AND user_id = ?
-                """,
-                (favorite_id, user_id)
-            )
+    audit("addproduct", str(product_id))
 
-        await query.message.reply_text(
-            "🗑 Запись удалена из избранного."
-        )
-        return
-
-    if data.startswith("product:"):
-        try:
-            product_id = int(data.split(":", 1)[1])
-        except ValueError:
-            return
-
-        await show_product(query, product_id)
-        return
-
-    if data.startswith("buy:"):
-        try:
-            product_id = int(data.split(":", 1)[1])
-        except ValueError:
-            return
-
-        await buy_product(query, context, product_id)
-        return
-
-    if data.startswith("fav_product:"):
-        try:
-            product_id = int(data.split(":", 1)[1])
-        except ValueError:
-            return
-
-        with get_db() as db:
-            product = db.execute(
-                """
-                SELECT name
-                FROM products
-                WHERE id = ? AND active = 1
-                """,
-                (product_id,)
-            ).fetchone()
-
-        if not product:
-            await query.message.reply_text("❌ Товар не найден.")
-            return
-
-        added = await add_favorite(
-            user_id,
-            "product",
-            f"{product_id}:{product['name']}"
-        )
-
-        await query.message.reply_text(
-            "⭐ Товар добавлен в избранное."
-            if added
-            else "ℹ️ Товар уже есть в избранном."
-        )
-        return
-
-    if data.startswith("admin:"):
-        if not is_admin(user_id):
-            await query.message.reply_text("⛔ Нет доступа.")
-            return
-
-        section = data.split(":", 1)[1]
-
-        if section == "stats":
-            await admin_stats(update, context)
-        elif section == "users":
-            await list_users(update, context)
-        elif section == "shop":
-            await show_shop(update, context)
-        elif section == "promos":
-            await show_promos(update, context)
-
-        return
-
-
-# ---------- TEXT ROUTER ----------
-
-async def text_handler(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-    message = update.effective_message
-    user = update.effective_user
-
-    if not message or not message.text or not user:
-        return
-
-    if not await ensure_access(update, context):
-        return
-
-    text = message.text.strip()
-
-    if context.user_data.get("waiting_support_message"):
-        await handle_support_message(update, context)
-        return
-
-    routes = {
-        "🔎 DATA HUNTER": data_hunter,
-        "🌐 WEB TOOLS": web_tools,
-        "🛡 SECURITY CENTER": security_center,
-        "🎁 GIFTS SHOP": show_gifts_shop,
-        "🛍 PROTIVZLA SHOP": show_shop,
-        "👤 USER PROFILE": show_profile,
-        "🎧 SUPPORT": support_menu,
-        "🛠 ADMIN PANEL": admin_panel,
-        "🎟 PROMO CODES": show_promos,
-        "📊 STATISTICS": show_statistics,
-        "📜 ACTION HISTORY": show_history,
-        "🎲 USERNAME GENERATOR": username_generator,
-        "⭐ FAVORITES": show_favorites,
-    }
-
-    handler = routes.get(text)
-
-    if handler:
-        await handler(update, context)
-        log_action(user.id, "menu", text)
-        return
-
-    await message.reply_text(
-        "🤖 Не понял команду.\n\n"
-        "Выбери раздел в меню или используй /help."
+    await message.answer(
+        f"✅ Товар добавлен. ID: {product_id}"
     )
 
 
-# ---------- HELP ----------
+@dp.message(Command("user"))
+async def user_lookup(message: Message):
+    if not await om(message):
+        return
 
-async def help_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-    await update.effective_message.reply_text(
-        "🤖 <b>PROTIVZLA ULTIMATE</b>\n\n"
-        "/start — главное меню\n"
-        "/help — помощь\n"
-        "/search запрос — поиск публичных страниц\n"
-        "/webcheck URL — проверить сайт\n"
-        "/dns домен — DNS-адреса\n"
-        "/ssl домен — TLS-сертификат\n"
-        "/promo КОД — активировать промокод\n"
-        "/admin_stats — статистика администратора\n\n"
-        "Не отправляй боту пароли и секретные коды.",
-        parse_mode="HTML"
+    parts = (message.text or "").split()
+
+    if len(parts) != 2 or not parts[1].isdigit():
+        await message.answer(
+            "Формат: /user TELEGRAM_ID"
+        )
+        return
+
+    with db() as c:
+        user = c.execute(
+            "SELECT * FROM users WHERE id=?",
+            (int(parts[1]),),
+        ).fetchone()
+
+    if not user:
+        await message.answer("Пользователь не найден.")
+        return
+
+    await message.answer(
+        f"ID: {user['id']}\n"
+        f"Имя: {html.escape(user['name'] or '')}\n"
+        f"Баллы: {user['points']}\n"
+        f"VIP: {html.escape(user['vip'])}"
     )
 
 
-# ---------- ERROR HANDLER ----------
+@dp.message(Command("setvip"))
+async def set_vip(message: Message):
+    if not await om(message):
+        return
 
-async def error_handler(
-    update: object,
-    context: ContextTypes.DEFAULT_TYPE
-):
-    logging.error(
-        "Unhandled bot error",
-        exc_info=context.error
-    )
+    parts = (message.text or "").split(maxsplit=2)
 
+    if len(parts) != 3 or not parts[1].isdigit():
+        await message.answer(
+            "Формат: /setvip ID Статус"
+        )
+        return
 
-# ---------- MAIN ----------
-
-def main():
-    if not BOT_TOKEN:
-        raise RuntimeError(
-            "Не задан BOT_TOKEN в переменных окружения."
+    with db() as c:
+        result = c.execute(
+            "UPDATE users SET vip=? WHERE id=?",
+            (parts[2][:50], int(parts[1])),
         )
 
-    init_db()
+    if result.rowcount:
+        audit("setvip", f"{parts[1]}={parts[2]}")
+        await message.answer("VIP обновлён.")
+    else:
+        await message.answer("Пользователь не найден.")
 
-    application = (
-        Application.builder()
-        .token(BOT_TOKEN)
-        .build()
+
+# ==================== ЗАПУСК ====================
+
+async def main():
+    init()
+
+    bot = Bot(
+        TOKEN,
+        default=DefaultBotProperties(
+            parse_mode=ParseMode.HTML,
+        ),
     )
 
-    # Основные команды
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler("search", search_command))
-    application.add_handler(CommandHandler("webcheck", webcheck_command))
-    application.add_handler(CommandHandler("dns", dns_command))
-    application.add_handler(CommandHandler("ssl", ssl_command))
-    application.add_handler(CommandHandler("promo", redeem_promo))
-
-    # Административные команды
-    application.add_handler(CommandHandler("admin_stats", admin_stats))
-    application.add_handler(CommandHandler("users", list_users))
-    application.add_handler(CommandHandler("block", block_cmd))
-    application.add_handler(CommandHandler("unblock", unblock_cmd))
-    application.add_handler(CommandHandler("broadcast", broadcast_cmd))
-    application.add_handler(CommandHandler("ticket_reply", ticket_reply_cmd))
-    application.add_handler(CommandHandler("product_add", product_add_cmd))
-    application.add_handler(CommandHandler("promo_create", promo_create_cmd))
-
-    # Telegram Stars
-    application.add_handler(
-        PreCheckoutQueryHandler(precheckout_handler)
+    asyncio.create_task(
+        scheduler(bot)
     )
 
-    application.add_handler(
-        MessageHandler(
-            filters.SUCCESSFUL_PAYMENT,
-            successful_payment_handler
+    with db() as c:
+        c.execute(
+            "UPDATE broadcasts SET status='В очереди' "
+            "WHERE status='Выполняется'"
         )
-    )
 
-    # Кнопки и текстовые сообщения
-    application.add_handler(
-        CallbackQueryHandler(callback_router)
-    )
+        queued = c.execute(
+            "SELECT id FROM broadcasts WHERE status='В очереди'"
+        ).fetchall()
 
-    application.add_handler(
-        MessageHandler(
-            filters.TEXT & ~filters.COMMAND,
-            text_handler
+    for row in queued:
+        asyncio.create_task(
+            run_bc(bot, row["id"])
         )
+
+    logging.info(
+        "PROTIVZLA запущен. Owner ID=%s, DB=%s",
+        OWNER_ID,
+        DB_PATH,
     )
 
-    application.add_error_handler(error_handler)
-
-    logging.info("PROTIVZLA ULTIMATE starting...")
-
-    application.run_polling(
-        allowed_updates=Update.ALL_TYPES
+    await dp.start_polling(
+        bot,
+        allowed_updates=dp.resolve_used_update_types(),
     )
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
