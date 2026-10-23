@@ -1834,6 +1834,17 @@ async def main():
     )
 
     await dp.start_polling(
+        async def health(request):
+return web.Response(text=“PROTIVZLA OK”)
+
+app = web.Application()
+app.router.add_get("/", health)
+runner = web.AppRunner(app)
+await runner.setup()
+port = int(os.environ.get("PORT", "10000"))
+site = web.TCPSite(runner, "0.0.0.0", port)
+await site.start()
+logging.info("HTTP server started on port %s", port)
         bot,
         allowed_updates=dp.resolve_used_update_types(),
     )
