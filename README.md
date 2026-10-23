@@ -1,22 +1,15 @@
-# PROTIVZLA ULTIMATE
-
-Telegram-бот с тёмно-зелёным оформлением.
-
-## Возможности
-
-- Обязательная подписка на @ProtivzlaNFT
-- Админ-панель
-- Статистика пользователей
-- Генератор никнеймов
-- История запросов
-- Избранное
-
-## Запуск
-
-1. Установите зависимости:
-   pip install -r requirements.txt
-
-2. Укажите переменные окружения BOT_TOKEN и ADMIN_IDS.
-
-3. Запустите бота:
-   python bot.py
+services:
+  - type: worker
+    name: protivzla-ultimate
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: ADMIN_IDS
+        sync: false
+      - key: REQUIRED_CHAT
+        sync: false
+      - key: REQUIRED_CHAT_URL
+        sync: false
