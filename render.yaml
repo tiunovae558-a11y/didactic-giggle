@@ -7,9 +7,11 @@ services:
     envVars:
       - key: BOT_TOKEN
         sync: false
-      - key: ADMIN_IDS
+      - key: OWNER_ID
         sync: false
-      - key: REQUIRED_CHAT
-        sync: false
-      - key: REQUIRED_CHAT_URL
-        sync: false
+      - key: SUPPORT_USERNAME
+        value: "@suqexo"
+      - key: DB_PATH
+        value: "/var/data/protivzla.db"
+      - key: BROADCAST_DELAY
+        value: "0.08"
