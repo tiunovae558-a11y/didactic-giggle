@@ -9,3 +9,7 @@ services:
         sync: false
       - key: ADMIN_IDS
         sync: false
+      - key: REQUIRED_CHAT
+        sync: false
+      - key: REQUIRED_CHAT_URL
+        sync: false
